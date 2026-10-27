@@ -100,6 +100,11 @@ public class MainActivity extends Activity implements SensorEventListener {
     private boolean resumed;
     private SensorManager sensors;
     private final float[] rotTmp = new float[9];
+    private boolean cameraTracking;    // 6DoF through ARCore instead of the motion sensors
+    // Motion-sensor 6DoF: head offset from leaning, eased back to centre so it can't drift away.
+    private final float[] leanPos = new float[3], leanVel = new float[3];
+    private long lastAccelNs;
+    private boolean leanActive;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     // Controller state (UI thread)
@@ -136,11 +141,12 @@ public class MainActivity extends Activity implements SensorEventListener {
                 arUnsupported = "ARCore isn't working on this phone.";
             }
         } else {
-            arUnsupported = "6DoF needs Google's ARCore, which isn't in this build.";
+            arUnsupported = "Camera tracking needs Google's ARCore, which isn't in this build.";
         }
         trackingMode = prefs.getInt("tracking", SettingsOverlay.MODE_FOLLOW);
-        if (trackingMode == SettingsOverlay.MODE_6DOF && arUnsupported != null) trackingMode = SettingsOverlay.MODE_FOLLOW;
+        cameraTracking = prefs.getBoolean("arcore", false) && arUnsupported == null;
         renderer.follow = trackingMode == SettingsOverlay.MODE_FOLLOW;
+        renderer.sensor6 = trackingMode == SettingsOverlay.MODE_6DOF && !wantAr();
 
         FrameLayout root = new FrameLayout(this);
 
@@ -182,12 +188,18 @@ public class MainActivity extends Activity implements SensorEventListener {
 
             @Override
             public void onTrackingChanged(int mode) {
-                int old = trackingMode;
+                boolean wasAr = wantAr();
                 trackingMode = mode;
-                renderer.follow = mode == SettingsOverlay.MODE_FOLLOW;
                 prefs.edit().putInt("tracking", mode).apply();
-                if (mode == SettingsOverlay.MODE_6DOF && old != mode) startAr();
-                else if (old == SettingsOverlay.MODE_6DOF && mode != old) stopAr();
+                applyTracking(wasAr);
+            }
+
+            @Override
+            public void onCameraTrackingChanged(boolean on) {
+                boolean wasAr = wantAr();
+                cameraTracking = on;
+                prefs.edit().putBoolean("arcore", on).apply();
+                applyTracking(wasAr);
             }
 
             @Override
@@ -210,7 +222,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         gear.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                settings.setValues(renderer.distortion, renderer.eyeShift, trackingMode, arUnsupported);
+                settings.setValues(renderer.distortion, renderer.eyeShift, trackingMode, cameraTracking, arUnsupported);
                 settings.setVisibility(View.VISIBLE);
                 gear.setVisibility(View.GONE);
                 resetButton.setVisibility(View.GONE);
@@ -465,7 +477,16 @@ public class MainActivity extends Activity implements SensorEventListener {
     }
 
     private boolean wantAr() {
-        return trackingMode == SettingsOverlay.MODE_6DOF && tracker != null && arUnsupported == null;
+        return trackingMode == SettingsOverlay.MODE_6DOF && cameraTracking
+                && tracker != null && arUnsupported == null;
+    }
+
+    /** Switches tracking to match the current settings, moving the camera to or from ARCore. */
+    private void applyTracking(boolean wasAr) {
+        renderer.follow = trackingMode == SettingsOverlay.MODE_FOLLOW;
+        renderer.sensor6 = trackingMode == SettingsOverlay.MODE_6DOF && !wantAr();
+        if (!wasAr && wantAr()) startAr();
+        else if (wasAr && !wantAr()) stopAr();
     }
 
     /** Hands the camera to ARCore for 6DoF tracking. */
@@ -517,12 +538,13 @@ public class MainActivity extends Activity implements SensorEventListener {
         });
     }
 
-    /** Called when 6DoF fails: switch to Smooth follow so the view keeps working. */
+    /** Called when ARCore fails: carry on in 6DoF with the motion sensors instead. */
     void fallBackFromAr() {
-        trackingMode = SettingsOverlay.MODE_FOLLOW;
-        renderer.follow = true;
-        prefs.edit().putInt("tracking", trackingMode).apply();
+        cameraTracking = false;
+        prefs.edit().putBoolean("arcore", false).apply();
+        renderer.sensor6 = trackingMode == SettingsOverlay.MODE_6DOF;
         stopAr();
+        toast("Switched 6DoF to the motion sensors");
     }
 
     /** Puts the browser straight in front of where you are and where you're looking. */
@@ -670,6 +692,8 @@ public class MainActivity extends Activity implements SensorEventListener {
         if (rv == null) rv = sensors.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
         if (rv != null) {
             sensors.registerListener(this, rv, SensorManager.SENSOR_DELAY_GAME);
+            Sensor lin = sensors.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION);
+            if (lin != null) sensors.registerListener(this, lin, SensorManager.SENSOR_DELAY_GAME);
         } else {
             toast("No rotation sensor on this phone, so the panel stays still");
         }
@@ -708,11 +732,52 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     @Override
     public void onSensorChanged(SensorEvent e) {
+        if (e.sensor.getType() == Sensor.TYPE_LINEAR_ACCELERATION) {
+            onLinearAcceleration(e);
+            return;
+        }
         float[] v = e.values;
         // Some phones reject the optional 5th value; only the first 4 are needed.
         float[] q = v.length > 4 ? new float[]{v[0], v[1], v[2], v[3]} : v;
         SensorManager.getRotationMatrixFromVector(rotTmp, q);
         renderer.setHeadRotation(rotTmp);
+    }
+
+    /**
+     * Motion-sensor 6DoF: turns acceleration (gravity removed) into a small head offset. A spring
+     * pulls it back to centre within about a second, because adding up acceleration on its own
+     * drifts by metres within seconds. So leaning and quick head moves show up; walking doesn't.
+     */
+    private void onLinearAcceleration(SensorEvent e) {
+        if (!renderer.sensor6) {
+            if (leanActive) {
+                for (int i = 0; i < 3; i++) leanPos[i] = leanVel[i] = 0f;
+                renderer.setHeadPosition(0f, 0f, 0f);
+                leanActive = false;
+            }
+            lastAccelNs = 0;
+            return;
+        }
+        float dt = lastAccelNs == 0 ? 0f : Math.min(0.05f, (e.timestamp - lastAccelNs) / 1e9f);
+        lastAccelNs = e.timestamp;
+        leanActive = true;
+
+        // Phone axes -> world axes (same world as the rotation sensor: Z up).
+        float ax = e.values[0], ay = e.values[1], az = e.values[2];
+        float[] a = new float[3];
+        for (int i = 0; i < 3; i++) a[i] = rotTmp[3 * i] * ax + rotTmp[3 * i + 1] * ay + rotTmp[3 * i + 2] * az;
+        // Ignore sensor noise and tiny tremors.
+        float mag = (float) Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+        float keep = mag > 0.15f ? (mag - 0.15f) / mag : 0f;
+
+        final float SPRING = 9f, DAMP = 6f, LIMIT = 0.3f; // critically damped, ~1 s to settle
+        for (int i = 0; i < 3; i++) {
+            leanVel[i] += (a[i] * keep - DAMP * leanVel[i] - SPRING * leanPos[i]) * dt;
+            leanPos[i] += leanVel[i] * dt;
+            if (leanPos[i] > LIMIT) { leanPos[i] = LIMIT; leanVel[i] = 0f; }
+            if (leanPos[i] < -LIMIT) { leanPos[i] = -LIMIT; leanVel[i] = 0f; }
+        }
+        renderer.setHeadPosition(leanPos[0], leanPos[1], leanPos[2]);
     }
 
     @Override
@@ -873,6 +938,9 @@ public class MainActivity extends Activity implements SensorEventListener {
         volatile boolean pressed, recenter;
         volatile boolean follow = true;    // smooth-follow mode; false = stays fixed (3DoF)
         volatile boolean useAr;            // 6DoF: ARCore supplies the camera and head pose
+        volatile boolean sensor6;          // 6DoF from the motion sensors (neck model + leaning)
+        // Neck model: your eyes sit this far above and in front of the point your head pivots on.
+        private static final float NECK_UP = 0.075f, NECK_FWD = 0.08f;
         volatile boolean arError;
         private int arTexId;
         private final float[] arRight = new float[3], arUp = new float[3], arFwd = new float[3],
@@ -1295,6 +1363,13 @@ public class MainActivity extends Activity implements SensorEventListener {
                     right = arRight.clone();
                     up = arUp.clone();
                     fwd = arFwd.clone();
+                }
+            }
+
+            if (!ar && sensor6) {
+                // Turning or nodding swings your eyes around your neck, so near things shift.
+                for (int i = 0; i < 3; i++) {
+                    head[i] += up[i] * NECK_UP + fwd[i] * NECK_FWD - worldUp[i] * NECK_UP;
                 }
             }
 
