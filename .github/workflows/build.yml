@@ -10,11 +10,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Android build tools (Ubuntu packages, no Gradle)
+      - name: Download ARCore (for 6DoF)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            android-sdk-build-tools android-sdk-platform-23 apksigner zipalign dalvik-exchange zip
+          META=$(curl -fsSL https://dl.google.com/android/maven2/com/google/ar/core/maven-metadata.xml)
+          V=$(echo "$META" | sed -n 's:.*<release>\(.*\)</release>.*:\1:p')
+          echo "ARCore version: $V"
+          curl -fsSL -o arcore.aar "https://dl.google.com/android/maven2/com/google/ar/core/$V/core-$V.aar"
+          unzip -l arcore.aar
 
       - name: Restore signing key
         env:
@@ -28,7 +30,7 @@ jobs:
           fi
 
       - name: Build
-        run: bash build.sh
+        run: ARCORE_AAR=arcore.aar bash build.sh
 
       - uses: actions/upload-artifact@v4
         with:

@@ -88,6 +88,9 @@ public class MainActivity extends Activity implements SensorEventListener {
     private View gear, resetButton;
     private SharedPreferences prefs;
     private int trackingMode = SettingsOverlay.MODE_FOLLOW;
+    private SixDofTracker tracker;     // null when this build has no ARCore
+    private boolean arActive;
+    private String arUnsupported;
 
     private HandlerThread camThread;
     private Handler camHandler;
@@ -121,8 +124,22 @@ public class MainActivity extends Activity implements SensorEventListener {
         prefs = getSharedPreferences("settings", MODE_PRIVATE);
         renderer.distortion = prefs.getBoolean("lens", true);
         renderer.eyeShift = prefs.getFloat("eyeShift", 0.025f);
+        try {
+            tracker = (SixDofTracker) Class.forName("com.stereocam.app.ArTracker").newInstance();
+        } catch (Throwable t) {
+            tracker = null; // built without ARCore
+        }
+        if (tracker != null) {
+            try {
+                arUnsupported = tracker.unsupportedReason(this);
+            } catch (Throwable t) {
+                arUnsupported = "ARCore isn't working on this phone.";
+            }
+        } else {
+            arUnsupported = "6DoF needs Google's ARCore, which isn't in this build.";
+        }
         trackingMode = prefs.getInt("tracking", SettingsOverlay.MODE_FOLLOW);
-        if (trackingMode == SettingsOverlay.MODE_6DOF) trackingMode = SettingsOverlay.MODE_FOLLOW; // not in this build
+        if (trackingMode == SettingsOverlay.MODE_6DOF && arUnsupported != null) trackingMode = SettingsOverlay.MODE_FOLLOW;
         renderer.follow = trackingMode == SettingsOverlay.MODE_FOLLOW;
 
         FrameLayout root = new FrameLayout(this);
@@ -165,9 +182,12 @@ public class MainActivity extends Activity implements SensorEventListener {
 
             @Override
             public void onTrackingChanged(int mode) {
+                int old = trackingMode;
                 trackingMode = mode;
                 renderer.follow = mode == SettingsOverlay.MODE_FOLLOW;
                 prefs.edit().putInt("tracking", mode).apply();
+                if (mode == SettingsOverlay.MODE_6DOF && old != mode) startAr();
+                else if (old == SettingsOverlay.MODE_6DOF && mode != old) stopAr();
             }
 
             @Override
@@ -190,7 +210,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         gear.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                settings.setValues(renderer.distortion, renderer.eyeShift, trackingMode);
+                settings.setValues(renderer.distortion, renderer.eyeShift, trackingMode, arUnsupported);
                 settings.setVisibility(View.VISIBLE);
                 gear.setVisibility(View.GONE);
                 resetButton.setVisibility(View.GONE);
@@ -444,6 +464,67 @@ public class MainActivity extends Activity implements SensorEventListener {
         return true; // swallow other controller buttons so they don't reach the page oddly
     }
 
+    private boolean wantAr() {
+        return trackingMode == SettingsOverlay.MODE_6DOF && tracker != null && arUnsupported == null;
+    }
+
+    /** Hands the camera to ARCore for 6DoF tracking. */
+    private void startAr() {
+        if (!wantAr() || arActive || !resumed) return;
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return;
+        closeCamera();
+        // Give the camera a moment to be released before ARCore opens it.
+        ui.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!resumed || !wantAr() || arActive) return;
+                try {
+                    if (tracker.resume(MainActivity.this)) {
+                        arActive = true;
+                        renderer.arError = false;
+                        renderer.useAr = true;
+                        renderer.recenter = true;
+                    } else {
+                        toast("Install Google Play Services for AR to use 6DoF");
+                    }
+                } catch (Exception e) {
+                    toast("6DoF couldn't start: " + e.getMessage());
+                    fallBackFromAr();
+                }
+            }
+        }, 300);
+    }
+
+    /** Stops ARCore and goes back to the normal camera. */
+    private void stopAr() {
+        renderer.useAr = false;
+        glView.queueEvent(new Runnable() {
+            @Override
+            public void run() {
+                // Runs between frames, so ARCore isn't mid-update when it pauses.
+                ui.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (arActive) {
+                            tracker.pause();
+                            arActive = false;
+                        }
+                        renderer.recenter = true;
+                        maybeOpenCamera();
+                    }
+                });
+            }
+        });
+    }
+
+    /** Called when 6DoF fails: switch to Smooth follow so the view keeps working. */
+    void fallBackFromAr() {
+        trackingMode = SettingsOverlay.MODE_FOLLOW;
+        renderer.follow = true;
+        prefs.edit().putInt("tracking", trackingMode).apply();
+        stopAr();
+    }
+
     /** Puts the browser straight in front of where you are and where you're looking. */
     private void resetScreenPosition() {
         renderer.recenter = true;
@@ -550,7 +631,8 @@ public class MainActivity extends Activity implements SensorEventListener {
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
         if (code == REQ_CAMERA) {
             if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
-                maybeOpenCamera();
+                if (wantAr()) startAr();
+                else maybeOpenCamera();
             } else {
                 toast("Camera permission is needed to show your surroundings");
             }
@@ -580,7 +662,8 @@ public class MainActivity extends Activity implements SensorEventListener {
         camHandler = new Handler(camThread.getLooper());
         glView.onResume();
         web.onResume();
-        maybeOpenCamera();
+        if (wantAr()) startAr();
+        else maybeOpenCamera();
 
         sensors = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
         Sensor rv = sensors.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR);
@@ -607,7 +690,12 @@ public class MainActivity extends Activity implements SensorEventListener {
         if (sensors != null) sensors.unregisterListener(this);
         closeCamera();
         web.onPause();
-        glView.onPause();
+        glView.onPause();       // stops the render thread first...
+        if (arActive) {         // ...so ARCore can pause safely
+            renderer.useAr = false;
+            tracker.pause();
+            arActive = false;
+        }
         host.setSurface(null);
         pendingTexture = null; // GL context is lost; new textures arrive on resume
         if (camThread != null) {
@@ -651,11 +739,13 @@ public class MainActivity extends Activity implements SensorEventListener {
         pendingTexture = cam;
         webTex.setDefaultBufferSize(WEB_W, TEX_H);
         host.setSurface(new Surface(webTex));
-        maybeOpenCamera();
+        if (wantAr()) startAr();
+        else maybeOpenCamera();
     }
 
     private void maybeOpenCamera() {
         if (!resumed || pendingTexture == null || camera != null || camHandler == null) return;
+        if (wantAr()) return; // ARCore owns the camera in 6DoF
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return;
 
         CameraManager mgr = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
@@ -782,6 +872,12 @@ public class MainActivity extends Activity implements SensorEventListener {
         volatile float cursorU = 0.5f, cursorV = 0.3f, visibleFrac = (float) WEB_H / TEX_H;
         volatile boolean pressed, recenter;
         volatile boolean follow = true;    // smooth-follow mode; false = stays fixed (3DoF)
+        volatile boolean useAr;            // 6DoF: ARCore supplies the camera and head pose
+        volatile boolean arError;
+        private int arTexId;
+        private final float[] arRight = new float[3], arUp = new float[3], arFwd = new float[3],
+                arPos = new float[3], arMatrix = new float[16], arCamInfo = {0.62f, 16f / 9f};
+        private boolean arHavePose, arCameraLive;
 
         // Panel: metres per texture pixel, and distance from your eyes.
         private static final float PANEL_DIST = 1.5f;
@@ -962,6 +1058,8 @@ public class MainActivity extends Activity implements SensorEventListener {
 
             texId = newExternalTexture();
             webTexId = newExternalTexture();
+            arTexId = newExternalTexture();
+            arHavePose = false;
             surfaceTexture = new SurfaceTexture(texId);
             webTexture = new SurfaceTexture(webTexId);
             final SurfaceTexture st = surfaceTexture, wt = webTexture;
@@ -985,11 +1083,34 @@ public class MainActivity extends Activity implements SensorEventListener {
             GLES20.glClearColor(0, 0, 0, 1);
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
             if (surfaceTexture == null) return;
-            try {
-                surfaceTexture.updateTexImage();
-                surfaceTexture.getTransformMatrix(texMatrix);
-            } catch (RuntimeException e) {
-                // no camera frame yet
+            arCameraLive = false;
+            if (useAr && tracker != null && !arError) {
+                int st = tracker.update(arTexId, displayRotation, arRight, arUp, arFwd, arPos, arMatrix, arCamInfo);
+                if (st == SixDofTracker.FAILED) {
+                    arError = true;
+                    final String msg = tracker.lastError();
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            toast("6DoF stopped: " + msg);
+                            fallBackFromAr();
+                        }
+                    });
+                } else {
+                    arCameraLive = st >= SixDofTracker.CAMERA_ONLY;
+                    if (st == SixDofTracker.TRACKING) arHavePose = true;
+                }
+            } else {
+                try {
+                    surfaceTexture.updateTexImage();
+                    surfaceTexture.getTransformMatrix(texMatrix);
+                } catch (RuntimeException e) {
+                    // no camera frame yet
+                }
+            }
+            if (arCameraLive) {
+                tanHalfH = arCamInfo[0];
+                camAspect = arCamInfo[1];
             }
             try {
                 webTexture.updateTexImage();
@@ -1012,17 +1133,17 @@ public class MainActivity extends Activity implements SensorEventListener {
 
             GLES20.glUseProgram(program);
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId);
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, arCameraLive ? arTexId : texId);
             GLES20.glUniform1i(sTex, 0);
             GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, webTexId);
             GLES20.glUniform1i(sWeb, 1);
-            GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, texMatrix, 0);
+            GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, arCameraLive ? arMatrix : texMatrix, 0);
             GLES20.glUniformMatrix4fv(uWebMatrix, 1, false, webMatrix, 0);
             GLES20.glUniform1f(uAspect, eyeAspect);
             GLES20.glUniform1f(uCrop, crop);
             GLES20.glUniform1f(uDistort, distortion ? 1f : 0f);
-            GLES20.glUniform1f(uRot, (float) displayRotation);
+            GLES20.glUniform1f(uRot, arCameraLive ? 0f : (float) displayRotation); // ARCore's matrix already rotates
             setPanelUniforms();
             GLES20.glEnableVertexAttribArray(aPos);
             GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad);
@@ -1068,6 +1189,11 @@ public class MainActivity extends Activity implements SensorEventListener {
             GLES20.glUniform1f(uVis, vis);
             GLES20.glUniform2f(uCursor, cursorU, cursorV);
             GLES20.glUniform1f(uPress, pressed ? 1f : 0f);
+            boolean ar = useAr;
+            if (ar) {
+                ok = arHavePose;
+                System.arraycopy(arPos, 0, head, 0, 3);
+            }
             if (!ok) {
                 GLES20.glUniform1f(uPanel, 0f);
                 return;
@@ -1084,6 +1210,14 @@ public class MainActivity extends Activity implements SensorEventListener {
                 default:                   right = neg(Y); up = X;      break; // ROTATION_90
             }
             float[] fwd = neg(Z);
+            // Which way is up in this world: +Z for the rotation sensor, +Y for ARCore.
+            float[] worldUp = {0f, 0f, 1f};
+            if (ar) {
+                right = arRight.clone();
+                up = arUp.clone();
+                fwd = arFwd.clone();
+                worldUp = new float[]{0f, 1f, 0f};
+            }
 
             if (!panelPlaced || recenter) {
                 // Reset: put the panel straight ahead of wherever your head is now.
@@ -1116,8 +1250,7 @@ public class MainActivity extends Activity implements SensorEventListener {
                 following = false;
             }
 
-            // Keep the panel level with the horizon (world up is +Z for this sensor).
-            float[] worldUp = {0f, 0f, 1f};
+            // Keep the panel level with the horizon.
             float[] pr = cross(panelDir, worldUp);
             if (len(pr) < 0.05f) pr = right.clone(); // looking straight up or down
             norm(pr);

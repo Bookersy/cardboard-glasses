@@ -38,6 +38,7 @@ public class SettingsOverlay extends FrameLayout {
     private boolean lens;
     private float eyeShift;
     private int mode;
+    private String sixDofUnavailable; // null when 6DoF can be used
 
     private TextView mode3, mode6, modeF, lensOn, lensOff, sepValue, note;
     private SeekBar sep;
@@ -109,9 +110,15 @@ public class SettingsOverlay extends FrameLayout {
         mode6.setOnClickListener(new OnClickListener() {
             @Override
             public void onClick(View v) {
-                // Not available yet: explain instead of switching.
-                note.setText("6DoF needs Google's ARCore, which isn't in this build yet.");
-                note.setTextColor(0xFFFFB86B);
+                if (sixDofUnavailable != null) {
+                    // Not possible here: explain instead of switching.
+                    note.setText(sixDofUnavailable);
+                    note.setTextColor(0xFFFFB86B);
+                    return;
+                }
+                mode = MODE_6DOF;
+                refresh();
+                SettingsOverlay.this.cb.onTrackingChanged(mode);
             }
         });
 
@@ -176,7 +183,8 @@ public class SettingsOverlay extends FrameLayout {
         addView(scroll, lp);
     }
 
-    public void setValues(boolean lens, float eyeShift, int mode) {
+    public void setValues(boolean lens, float eyeShift, int mode, String sixDofUnavailable) {
+        this.sixDofUnavailable = sixDofUnavailable;
         this.lens = lens;
         this.eyeShift = eyeShift;
         this.mode = mode;
@@ -185,12 +193,17 @@ public class SettingsOverlay extends FrameLayout {
 
     private void refresh() {
         style(mode3, mode == MODE_3DOF, true);
-        style(mode6, mode == MODE_6DOF, false);
+        style(mode6, mode == MODE_6DOF, sixDofUnavailable == null);
         style(modeF, mode == MODE_FOLLOW, true);
         note.setTextColor(MUTED);
-        note.setText(mode == MODE_FOLLOW
-                ? "Tracks head turns. The browser glides back in front of you when you look away."
-                : "Tracks head turns. The browser stays where it is; press Menu on the controller to bring it back.");
+        if (mode == MODE_FOLLOW) {
+            note.setText("Tracks head turns. The browser glides back in front of you when you look away.");
+        } else if (mode == MODE_6DOF) {
+            note.setText("Tracks turning and moving, using ARCore. The browser stays put in the room, "
+                    + "so you can walk up to it. Point the camera at a textured area for a moment to start.");
+        } else {
+            note.setText("Tracks head turns. The browser stays where it is; press Menu on the controller to bring it back.");
+        }
         style(lensOn, lens, true);
         style(lensOff, !lens, true);
         sep.setProgress(Math.round(eyeShift / 0.0005f));
