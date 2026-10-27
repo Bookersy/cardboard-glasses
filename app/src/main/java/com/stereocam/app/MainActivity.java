@@ -25,6 +25,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.Message;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Size;
@@ -32,65 +33,64 @@ import android.util.SizeF;
 import android.view.Choreographer;
 import android.view.Gravity;
 import android.view.InputDevice;
-import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
 import android.view.WindowManager;
-import android.webkit.JavascriptInterface;
-import android.webkit.WebChromeClient;
-import android.webkit.WebResourceError;
-import android.webkit.WebResourceRequest;
-import android.webkit.WebSettings;
 import android.webkit.WebView;
-import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.Toast;
-
-import org.json.JSONObject;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.FloatBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
 
 /**
- * Cardboard-style passthrough with a floating web browser.
+ * Cardboard-style passthrough with floating web browser windows.
  *
- * The rear camera fills both eyes. A browser panel floats in front of you, anchored in the
- * world by the rotation sensor and gliding back in front when you look far away.
+ * The rear camera fills both eyes. Browser windows float in the room, placed using the rotation
+ * sensor (or ARCore in 6DoF). A cursor floats in front of you: aim it with the left stick, and
+ * it moves with your head.
  *
  * Controller (Stadia or any Bluetooth gamepad):
- *   Left stick  - move the cursor        Right stick - scroll the page
- *   R2 or A     - click (hold to drag)   B or L1     - back        R1 - forward
- *   Y           - show / hide keyboard   Menu (Start) - bring the panel back in front
- *   D-pad       - nudge the cursor
- * Reset button (top left of the screen): put the browser back in front of you.
- * Gear button (top right of the screen): settings for head tracking, lens correction
- * and eye separation. Volume keys also change eye separation.
+ *   Left stick   - aim the cursor              Right stick  - scroll (while moving a window: push / pull)
+ *   R2 or A      - click (hold to drag-select) L2           - hold to grab and move the window you point at
+ *   B            - close keyboard, or back     L1 / R1      - back / forward
+ *   Y            - show / hide keyboard        X            - new window
+ *   Menu (Start) - bring the windows back in front of you
+ *   D-pad        - nudge the cursor
+ * Each window's top bar: back, forward, reload, address box, grip (hold R2 on it to move the
+ * window), new window, close.
+ * Reset button (top left of the screen) and gear button (top right): as the Menu button, and
+ * settings. Volume keys change eye separation.
  */
 public class MainActivity extends Activity implements SensorEventListener {
 
     private static final int REQ_CAMERA = 1;
     private static final String HOME = "https://www.google.com";
+    private static final int MAX_WINDOWS = 4;
 
-    // Panel texture layout, in pixels: the page on top, the keyboard underneath.
-    static final int WEB_W = 1024, WEB_H = 640, KB_H = 300, TEX_H = WEB_H + KB_H;
     // Pages are laid out this many CSS pixels wide (like a small laptop), then scaled onto the panel.
-    // Laying out at the phone's own density gave a ~370px-wide phone page with huge text.
     private static final float PAGE_CSS_WIDTH = 900f;
     private float layoutScale = 1f; // view pixels per panel-texture pixel
 
     private GLSurfaceView glView;
     private StereoRenderer renderer;
-    private PanelHost host;
-    private WebView web;
-    private VrKeyboard keyboard;
-    private View loadingBar;
+    private FrameLayout root;
+    final CopyOnWriteArrayList<BrowserWindow> windows = new CopyOnWriteArrayList<>();
+    private final ConcurrentLinkedQueue<BrowserWindow> closedWindows = new ConcurrentLinkedQueue<>();
+    volatile BrowserWindow active;
+
     private SettingsOverlay settings;
     private View gear, resetButton;
     private SharedPreferences prefs;
@@ -111,22 +111,81 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     // Controller state (UI thread)
     private float lx, ly, rx, ry, hatX, hatY;
-    private boolean triggerDown, buttonADown, touching;
+    private boolean triggerDown, buttonADown, grabDown;
+    private boolean pressing, dragging, dragByGrab;
+    private BrowserWindow pressWin;
+    private float lastPressX = -1, lastPressY = -1;
     private long touchDownTime;
-    private float cursorX = WEB_W / 2f, cursorY = WEB_H / 2f;
-    private boolean keyboardWanted;
-    private float kbAnim;          // 0 hidden .. 1 shown
+    private float cursorYaw, cursorPitch; // radians, relative to where you're looking
     private long lastTickNanos;
     private boolean ticking;
+
+    private final BrowserWindow.Listener windowListener = new BrowserWindow.Listener() {
+        @Override
+        public void onEditFocus(BrowserWindow w) {
+            w.title.stopEditing();
+            setActive(w);
+            w.showKeyboard(true);
+        }
+
+        @Override
+        public void onTitleAction(final BrowserWindow w, int action) {
+            switch (action) {
+                case TitleBar.BACK:
+                    w.goBack();
+                    break;
+                case TitleBar.FORWARD:
+                    w.goForward();
+                    break;
+                case TitleBar.RELOAD:
+                    w.web.reload();
+                    break;
+                case TitleBar.ADDRESS:
+                    setActive(w);
+                    w.editAddress();
+                    break;
+                case TitleBar.NEW:
+                    newWindow(HOME, w);
+                    break;
+                case TitleBar.CLOSE:
+                    // Not from inside the view's own event handling.
+                    ui.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            closeWindow(w);
+                        }
+                    });
+                    break;
+            }
+        }
+
+        @Override
+        public boolean onOpenWindow(BrowserWindow from, Message resultMsg) {
+            BrowserWindow nw = newWindow(null, from);
+            if (nw == null) return false;
+            WebView.WebViewTransport t = (WebView.WebViewTransport) resultMsg.obj;
+            t.setWebView(nw.web);
+            resultMsg.sendToTarget();
+            return true;
+        }
+
+        @Override
+        public void onLoadError(BrowserWindow w, String message) {
+            toast(message);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        // Never pop up the phone's own keyboard; the panel has its own.
+        // Never pop up the phone's own keyboard; the panels have their own.
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
+        // No saved-password / autofill prompts: they appear on the real screen, out of sight.
+        NoAutofill.apply(getWindow().getDecorView());
 
         DisplayMetrics dm = getResources().getDisplayMetrics();
+        layoutScale = Math.max(1f, dm.density * PAGE_CSS_WIDTH / BrowserWindow.W);
         renderer = new StereoRenderer(dm.xdpi);
         prefs = getSharedPreferences("settings", MODE_PRIVATE);
         renderer.distortion = prefs.getBoolean("lens", true);
@@ -149,32 +208,8 @@ public class MainActivity extends Activity implements SensorEventListener {
         if (trackingMode == SettingsOverlay.MODE_6DOF && arUnsupported != null) trackingMode = SettingsOverlay.MODE_FOLLOW;
         renderer.follow = trackingMode == SettingsOverlay.MODE_FOLLOW;
 
-        FrameLayout root = new FrameLayout(this);
-
-        host = new PanelHost(this);
-        web = new WebView(this);
-        setupWebView();
-        keyboard = new VrKeyboard(this);
-        keyboard.setListener(new VrKeyboard.Listener() {
-            @Override
-            public void onKey(int type, String text) {
-                handleKeyboardKey(type, text);
-            }
-        });
-        layoutScale = Math.max(1f, getResources().getDisplayMetrics().density * PAGE_CSS_WIDTH / WEB_W);
-        host.setDrawScale(1f / layoutScale);
-        FrameLayout.LayoutParams wl = new FrameLayout.LayoutParams(px(WEB_W), px(WEB_H));
-        host.addView(web, wl);
-        FrameLayout.LayoutParams kl = new FrameLayout.LayoutParams(px(WEB_W), px(KB_H));
-        kl.topMargin = px(WEB_H);
-        host.addView(keyboard, kl);
-        // Thin bar across the top of the page while it loads.
-        loadingBar = new View(this);
-        loadingBar.setBackgroundColor(0xFF4C7DF0);
-        loadingBar.setPivotX(0f);
-        loadingBar.setScaleX(0f);
-        host.addView(loadingBar, new FrameLayout.LayoutParams(px(WEB_W), px(5)));
-        root.addView(host, new FrameLayout.LayoutParams(px(WEB_W), px(TEX_H)));
+        root = new FrameLayout(this);
+        NoAutofill.apply(root);
 
         glView = new GLSurfaceView(this);
         glView.setEGLContextClientVersion(2);
@@ -182,6 +217,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         glView.setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
         root.addView(glView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
         settings = new SettingsOverlay(this, new SettingsOverlay.Callbacks() {
             @Override
             public void onLensChanged(boolean on) {
@@ -245,6 +281,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         });
 
         setContentView(root);
+        newWindow(HOME, null);
 
         // Taps on the picture itself (e.g. the Cardboard button) do nothing for now.
         glView.setOnTouchListener(new View.OnTouchListener() {
@@ -279,116 +316,41 @@ public class MainActivity extends Activity implements SensorEventListener {
         }
     }
 
-    /** Panel-texture pixels to view pixels. */
-    private int px(float texturePx) {
-        return Math.round(texturePx * layoutScale);
-    }
+    // ------------------------------------------------------------------ windows
 
-    // ------------------------------------------------------------------ browser
-
-    private void setupWebView() {
-        WebSettings s = web.getSettings();
-        s.setJavaScriptEnabled(true);
-        s.setDomStorageEnabled(true);
-        s.setLoadWithOverviewMode(true);
-        s.setUseWideViewPort(true);
-        s.setSupportZoom(false);
-        s.setMediaPlaybackRequiresUserGesture(false);
-        // The browser is laid out bigger than the phone's screen and drawn off-screen into the
-        // panel, so make it draw the whole page rather than only the part it thinks is visible.
-        s.setOffscreenPreRaster(true);
-        web.setFocusable(true);
-        web.setFocusableInTouchMode(true);
-        web.addJavascriptInterface(new Object() {
-            @JavascriptInterface
-            public void editFocus() {
-                ui.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        showKeyboard(true);
-                    }
-                });
-            }
-        }, "VRBridge");
-        web.setWebViewClient(new WebViewClient() {
-            @Override
-            public void onPageFinished(WebView v, String url) {
-                injectFocusWatcher();
-            }
-
-            @Override
-            public void onPageCommitVisible(WebView v, String url) {
-                injectFocusWatcher();
-            }
-
-            @Override
-            public void onReceivedError(WebView v, WebResourceRequest req, WebResourceError err) {
-                if (req.isForMainFrame()) toast("Page didn't load: " + err.getDescription());
-            }
-        });
-        web.setWebChromeClient(new WebChromeClient() {
-            @Override
-            public void onProgressChanged(WebView v, int progress) {
-                loadingBar.setScaleX(progress / 100f);
-                loadingBar.setVisibility(progress >= 100 ? View.INVISIBLE : View.VISIBLE);
-            }
-        });
-        web.loadUrl(HOME);
-    }
-
-    /** Tells us when the page focuses a text field, so the keyboard can slide out. */
-    private void injectFocusWatcher() {
-        web.evaluateJavascript(
-                "(function(){if(window.__vrkb)return;window.__vrkb=1;" +
-                "function ed(e){if(!e)return false;if(e.isContentEditable)return true;" +
-                "var t=e.tagName;if(t==='TEXTAREA')return true;" +
-                "if(t==='INPUT'){var y=(e.getAttribute('type')||'text').toLowerCase();" +
-                "return ['text','search','email','url','tel','password','number'].indexOf(y)>=0;}" +
-                "return false;}" +
-                "document.addEventListener('focusin',function(e){if(ed(e.target)&&window.VRBridge)VRBridge.editFocus();},true);" +
-                "})();", null);
-    }
-
-    private void showKeyboard(boolean show) {
-        keyboardWanted = show;
-        if (!show) keyboard.setHover(-1, -1);
-    }
-
-    private void handleKeyboardKey(int type, String text) {
-        web.requestFocus();
-        switch (type) {
-            case VrKeyboard.CLOSE:
-                showKeyboard(false);
-                cursorY = Math.min(cursorY, WEB_H - 1);
-                return;
-            case VrKeyboard.DEL:
-                sendKey(KeyEvent.KEYCODE_DEL);
-                return;
-            case VrKeyboard.ENTER:
-                sendKey(KeyEvent.KEYCODE_ENTER);
-                return;
-            case VrKeyboard.SPACE:
-                typeText(" ");
-                return;
-            default:
-                typeText(text);
+    /** Opens a window (url null = an empty one a page will fill). Appears just in front of you. */
+    BrowserWindow newWindow(String url, BrowserWindow nextTo) {
+        if (windows.size() >= MAX_WINDOWS) {
+            toast("Up to " + MAX_WINDOWS + " windows. Close one first.");
+            return null;
         }
+        BrowserWindow w = new BrowserWindow(this, layoutScale, windowListener, url);
+        NoAutofill.apply(w.host);
+        root.addView(w.host, 0, w.hostLayout()); // behind the 3D view; it draws into a texture
+        w.placeNextTo = nextTo;
+        windows.add(w);
+        setActive(w);
+        return w;
     }
 
-    private void sendKey(int code) {
-        long t = SystemClock.uptimeMillis();
-        web.dispatchKeyEvent(new KeyEvent(t, t, KeyEvent.ACTION_DOWN, code, 0));
-        web.dispatchKeyEvent(new KeyEvent(t, t, KeyEvent.ACTION_UP, code, 0));
-    }
-
-    private void typeText(String s) {
-        KeyEvent[] evs = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD).getEvents(s.toCharArray());
-        if (evs != null) {
-            for (KeyEvent e : evs) web.dispatchKeyEvent(e);
-        } else {
-            // Characters with no key (e.g. some symbols): insert through the page instead.
-            web.evaluateJavascript("document.execCommand('insertText',false," + JSONObject.quote(s) + ")", null);
+    void closeWindow(BrowserWindow w) {
+        if (!windows.remove(w)) return;
+        if (pressWin == w) {
+            pressing = false;
+            pressWin = null;
+            renderer.pressWindow = null;
         }
+        if (dragging && renderer.dragWindow == w) endDrag();
+        root.removeView(w.host);
+        w.destroy();
+        closedWindows.add(w); // the render thread frees its texture
+        if (active == w) setActive(windows.isEmpty() ? null : windows.get(windows.size() - 1));
+        if (windows.isEmpty()) toast("Press X for a new window");
+    }
+
+    void setActive(BrowserWindow w) {
+        active = w;
+        for (BrowserWindow x : windows) x.title.setActive(x == w);
     }
 
     // ------------------------------------------------------------------ controller
@@ -431,6 +393,14 @@ public class MainActivity extends Activity implements SensorEventListener {
                 triggerDown = false;
                 updatePress();
             }
+            float lt = Math.max(axis(e, MotionEvent.AXIS_LTRIGGER), axis(e, MotionEvent.AXIS_BRAKE));
+            if (!grabDown && lt > 0.5f) {
+                grabDown = true;
+                updateGrab();
+            } else if (grabDown && lt < 0.3f) {
+                grabDown = false;
+                updateGrab();
+            }
             return true;
         }
         return super.dispatchGenericMotionEvent(e);
@@ -457,6 +427,7 @@ public class MainActivity extends Activity implements SensorEventListener {
                 || KeyEvent.isGamepadButton(code);
         if (!fromPad) return super.dispatchKeyEvent(e);
 
+        BrowserWindow w = active;
         switch (code) {
             case KeyEvent.KEYCODE_BUTTON_A:
             case KeyEvent.KEYCODE_BUTTON_R2:
@@ -465,37 +436,123 @@ public class MainActivity extends Activity implements SensorEventListener {
                     updatePress();
                 }
                 return true;
-            case KeyEvent.KEYCODE_BUTTON_B:
-            case KeyEvent.KEYCODE_BUTTON_L1:
-            case KeyEvent.KEYCODE_BACK:
-                if (first) {
-                    if (keyboardWanted && code == KeyEvent.KEYCODE_BUTTON_B) showKeyboard(false);
-                    else if (web.canGoBack()) web.goBack();
+            case KeyEvent.KEYCODE_BUTTON_L2:
+                if (down != grabDown && e.getRepeatCount() == 0) {
+                    grabDown = down;
+                    updateGrab();
                 }
                 return true;
+            case KeyEvent.KEYCODE_BUTTON_B:
+            case KeyEvent.KEYCODE_BACK:
+                if (first && w != null) {
+                    if (w.keyboardWanted) {
+                        w.title.stopEditing();
+                        w.showKeyboard(false);
+                    } else {
+                        w.goBack();
+                    }
+                }
+                return true;
+            case KeyEvent.KEYCODE_BUTTON_L1:
+                if (first && w != null) w.goBack();
+                return true;
             case KeyEvent.KEYCODE_BUTTON_R1:
-                if (first && web.canGoForward()) web.goForward();
+                if (first && w != null) w.goForward();
+                return true;
+            case KeyEvent.KEYCODE_BUTTON_X:
+                if (first) newWindow(HOME, w);
                 return true;
             case KeyEvent.KEYCODE_BUTTON_Y:
-                if (first) showKeyboard(!keyboardWanted);
+                if (first && w != null) {
+                    if (w.keyboardWanted) w.title.stopEditing();
+                    w.showKeyboard(!w.keyboardWanted);
+                }
                 return true;
             case KeyEvent.KEYCODE_BUTTON_START:
                 if (first) resetScreenPosition();
                 return true;
             case KeyEvent.KEYCODE_DPAD_LEFT:
-                if (down) cursorX -= 16;
+                if (down) cursorYaw -= 0.02f;
                 return true;
             case KeyEvent.KEYCODE_DPAD_RIGHT:
-                if (down) cursorX += 16;
+                if (down) cursorYaw += 0.02f;
                 return true;
             case KeyEvent.KEYCODE_DPAD_UP:
-                if (down) cursorY -= 16;
+                if (down) cursorPitch += 0.02f;
                 return true;
             case KeyEvent.KEYCODE_DPAD_DOWN:
-                if (down) cursorY += 16;
+                if (down) cursorPitch -= 0.02f;
                 return true;
         }
         return true; // swallow other controller buttons so they don't reach the page oddly
+    }
+
+    /** R2 / A: click whatever the cursor is on, or start moving a window from its grip. */
+    private void updatePress() {
+        boolean want = triggerDown || buttonADown;
+        renderer.pressed = want;
+        if (want && !pressing && !dragging) {
+            BrowserWindow w = renderer.hitWindow;
+            if (w == null) return;
+            float x = renderer.hitX, y = renderer.hitY;
+            setActive(w);
+            if (y < BrowserWindow.TITLE_H && w.title.regionAt(x * layoutScale) == TitleBar.DRAG) {
+                startDrag(w, false);
+                return;
+            }
+            if (y >= BrowserWindow.TITLE_H && y < BrowserWindow.BASE_H && w.title.isEditing()) {
+                // Clicked the page while typing an address: stop typing it.
+                w.title.stopEditing();
+                w.showKeyboard(false);
+            }
+            pressing = true;
+            pressWin = w;
+            renderer.pressWindow = w;
+            touchDownTime = SystemClock.uptimeMillis();
+            lastPressX = x;
+            lastPressY = y;
+            w.touch(MotionEvent.ACTION_DOWN, x, y, touchDownTime);
+        } else if (!want) {
+            if (dragging && !dragByGrab) endDrag();
+            if (pressing) {
+                pressing = false;
+                BrowserWindow w = pressWin;
+                pressWin = null;
+                renderer.pressWindow = null;
+                if (w != null) {
+                    w.touch(MotionEvent.ACTION_UP, lastPressX, lastPressY, touchDownTime);
+                    if (lastPressY >= BrowserWindow.TITLE_H && lastPressY < BrowserWindow.BASE_H) {
+                        w.checkTappedTextField();
+                    }
+                }
+            }
+        }
+    }
+
+    /** L2: grab the window under the cursor and move it while held. */
+    private void updateGrab() {
+        if (grabDown && !dragging && !pressing) {
+            BrowserWindow w = renderer.hitWindow;
+            if (w != null) {
+                setActive(w);
+                startDrag(w, true);
+            }
+        } else if (!grabDown && dragging && dragByGrab) {
+            endDrag();
+        }
+    }
+
+    private void startDrag(BrowserWindow w, boolean byGrab) {
+        dragging = true;
+        dragByGrab = byGrab;
+        renderer.dragPush = 0f;
+        renderer.dragWindow = w;
+    }
+
+    private void endDrag() {
+        dragging = false;
+        renderer.dragWindow = null;
+        renderer.dragPush = 0f;
     }
 
     private boolean wantAr() {
@@ -532,6 +589,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     /** Stops ARCore and goes back to the normal camera. */
     private void stopAr() {
         renderer.useAr = false;
+        renderer.clearAnchors = true;
         glView.queueEvent(new Runnable() {
             @Override
             public void run() {
@@ -559,61 +617,12 @@ public class MainActivity extends Activity implements SensorEventListener {
         stopAr();
     }
 
-    /** Puts the browser straight in front of where you are and where you're looking. */
+    /** Puts the windows back in front of you: the active one straight ahead, others beside it. */
     private void resetScreenPosition() {
+        cursorYaw = 0f;
+        cursorPitch = 0f;
         renderer.recenter = true;
-        toast("Screen moved in front of you");
-    }
-
-    /** Turns trigger / A presses into touch down and up on the panel. */
-    private void updatePress() {
-        boolean want = triggerDown || buttonADown;
-        if (want && !touching) {
-            touching = true;
-            touchDownTime = SystemClock.uptimeMillis();
-            sendTouch(MotionEvent.ACTION_DOWN);
-        } else if (!want && touching) {
-            touching = false;
-            sendTouch(MotionEvent.ACTION_UP);
-            if (cursorY < WEB_H) checkTappedTextField();
-        }
-        renderer.pressed = touching;
-    }
-
-    private void sendTouch(int action) {
-        MotionEvent ev = MotionEvent.obtain(touchDownTime, SystemClock.uptimeMillis(), action,
-                cursorX * layoutScale, cursorY * layoutScale, 0);
-        ev.setSource(InputDevice.SOURCE_TOUCHSCREEN);
-        if (cursorY < WEB_H) web.requestFocus();
-        host.dispatchTouchEvent(ev);
-        ev.recycle();
-    }
-
-    /** Backup for pages where the focus watcher can't see the field (e.g. inside frames). */
-    private void checkTappedTextField() {
-        ui.postDelayed(new Runnable() {
-            @Override
-            public void run() {
-                WebView.HitTestResult r = web.getHitTestResult();
-                if (r != null && r.getType() == WebView.HitTestResult.EDIT_TEXT_TYPE) showKeyboard(true);
-            }
-        }, 200);
-    }
-
-    private void sendScroll(float v, float h) {
-        long t = SystemClock.uptimeMillis();
-        MotionEvent.PointerProperties[] pp = {new MotionEvent.PointerProperties()};
-        pp[0].id = 0;
-        pp[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
-        MotionEvent.PointerCoords[] pc = {new MotionEvent.PointerCoords()};
-        pc[0].x = cursorX * layoutScale;
-        pc[0].y = cursorY * layoutScale;
-        pc[0].setAxisValue(MotionEvent.AXIS_VSCROLL, v);
-        pc[0].setAxisValue(MotionEvent.AXIS_HSCROLL, h);
-        MotionEvent ev = MotionEvent.obtain(t, t, MotionEvent.ACTION_SCROLL, 1, pp, pc,
-                0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
-        web.dispatchGenericMotionEvent(ev);
-        ev.recycle();
+        toast(windows.size() > 1 ? "Windows moved in front of you" : "Screen moved in front of you");
     }
 
     private static float shape(float v) {
@@ -624,7 +633,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         return Math.signum(v) * n * n;
     }
 
-    /** Runs every display frame: moves the cursor, scrolls, animates the keyboard. */
+    /** Runs every display frame: aims the cursor, scrolls, moves windows, animates keyboards. */
     private final Choreographer.FrameCallback tick = new Choreographer.FrameCallback() {
         @Override
         public void doFrame(long frameNanos) {
@@ -632,33 +641,41 @@ public class MainActivity extends Activity implements SensorEventListener {
             float dt = lastTickNanos == 0 ? 0f : Math.min(0.05f, (frameNanos - lastTickNanos) / 1e9f);
             lastTickNanos = frameNanos;
 
-            float speed = 1100f; // pixels per second at full tilt
-            float dx = shape(lx) * speed * dt + hatX * 300f * dt;
-            float dy = shape(ly) * speed * dt + hatY * 300f * dt;
+            // Cursor: an angle away from where you're looking, so it travels with your head.
+            float speed = 0.9f; // radians per second at full tilt
+            cursorYaw += (shape(lx) * speed + hatX * 0.25f) * dt;
+            cursorPitch -= (shape(ly) * speed + hatY * 0.25f) * dt;
+            cursorYaw = Math.max(-0.36f, Math.min(0.36f, cursorYaw));
+            cursorPitch = Math.max(-0.30f, Math.min(0.30f, cursorPitch));
+            renderer.cursorYaw = cursorYaw;
+            renderer.cursorPitch = cursorPitch;
 
-            float target = keyboardWanted ? 1f : 0f;
-            kbAnim += (target - kbAnim) * (1f - (float) Math.exp(-dt * 12f));
-            if (Math.abs(target - kbAnim) < 0.002f) kbAnim = target;
-            float visH = WEB_H + KB_H * kbAnim;
+            for (BrowserWindow w : windows) w.animate(dt);
 
-            float ox = cursorX, oy = cursorY;
-            cursorX = Math.max(0f, Math.min(WEB_W - 1f, cursorX + dx));
-            cursorY = Math.max(0f, Math.min(visH - 1f, cursorY + dy));
-            if (touching && (cursorX != ox || cursorY != oy)) sendTouch(MotionEvent.ACTION_MOVE);
+            BrowserWindow hit = renderer.hitWindow;
+            float hx = renderer.hitX, hy = renderer.hitY;
+            for (BrowserWindow w : windows) {
+                if (w == hit && !dragging) w.hover(hx, hy);
+                else w.hover(-1, -1);
+            }
+
+            // Holding R2 on a page: keep the touch moving with the cursor (drag-select, sliders).
+            if (pressing && pressWin != null) {
+                float px = renderer.pressX, py = renderer.pressY;
+                if (px != lastPressX || py != lastPressY) {
+                    lastPressX = px;
+                    lastPressY = py;
+                    pressWin.touch(MotionEvent.ACTION_MOVE, px, py, touchDownTime);
+                }
+            }
 
             float sv = shape(-ry), sh = shape(rx);
-            if ((sv != 0f || sh != 0f) && cursorY < WEB_H && !touching) sendScroll(sv * 0.6f, sh * 0.6f);
-
-            if (keyboardWanted && cursorY >= WEB_H) keyboard.setHover(cursorX * layoutScale, (cursorY - WEB_H) * layoutScale);
-            else keyboard.setHover(-1, -1);
-
-            renderer.cursorU = cursorX / WEB_W;
-            renderer.cursorV = cursorY / TEX_H;
-            renderer.visibleFrac = visH / TEX_H;
-
-            // Redraw the panel every frame. Waiting for the page to say it changed missed
-            // updates, so clicks looked like they did nothing until something else redrew.
-            host.invalidate();
+            if (dragging) {
+                renderer.dragPush = -shape(ry) * 1.2f; // push away / pull closer, metres per second
+            } else if ((sv != 0f || sh != 0f) && hit != null && !pressing
+                    && hy >= BrowserWindow.TITLE_H && hy < BrowserWindow.BASE_H) {
+                hit.scroll(hx, hy, sv * 0.6f, sh * 0.6f);
+            }
 
             Choreographer.getInstance().postFrameCallback(this);
         }
@@ -700,7 +717,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         camThread.start();
         camHandler = new Handler(camThread.getLooper());
         glView.onResume();
-        web.onResume();
+        for (BrowserWindow w : windows) w.web.onResume();
         if (wantAr()) startAr();
         else maybeOpenCamera();
 
@@ -710,7 +727,7 @@ public class MainActivity extends Activity implements SensorEventListener {
         if (rv != null) {
             sensors.registerListener(this, rv, SensorManager.SENSOR_DELAY_GAME);
         } else {
-            toast("No rotation sensor on this phone, so the panel stays still");
+            toast("No rotation sensor on this phone, so the windows stay still");
         }
 
         ticking = true;
@@ -722,20 +739,22 @@ public class MainActivity extends Activity implements SensorEventListener {
     protected void onPause() {
         resumed = false;
         ticking = false;
-        if (touching) {
-            touching = false;
-            sendTouch(MotionEvent.ACTION_CANCEL);
-        }
+        if (pressing && pressWin != null) pressWin.touch(MotionEvent.ACTION_CANCEL, lastPressX, lastPressY, touchDownTime);
+        pressing = false;
+        pressWin = null;
+        renderer.pressWindow = null;
+        if (dragging) endDrag();
         if (sensors != null) sensors.unregisterListener(this);
         closeCamera();
-        web.onPause();
+        for (BrowserWindow w : windows) w.web.onPause();
         glView.onPause();       // stops the render thread first...
         if (arActive) {         // ...so ARCore can pause safely
             renderer.useAr = false;
+            renderer.clearAnchors = true;
             tracker.pause();
             arActive = false;
         }
-        host.setSurface(null);
+        for (BrowserWindow w : windows) w.setSurface(null);
         pendingTexture = null; // GL context is lost; new textures arrive on resume
         if (camThread != null) {
             camThread.quitSafely();
@@ -773,11 +792,9 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     // ------------------------------------------------------------------ camera
 
-    /** Called on the UI thread once the GL thread has made its textures. */
-    void onTexturesReady(SurfaceTexture cam, SurfaceTexture webTex) {
+    /** Called on the UI thread once the GL thread has made the camera texture. */
+    void onCameraTextureReady(SurfaceTexture cam) {
         pendingTexture = cam;
-        webTex.setDefaultBufferSize(WEB_W, TEX_H);
-        host.setSurface(new Surface(webTex));
         if (wantAr()) startAr();
         else maybeOpenCamera();
     }
@@ -804,7 +821,7 @@ public class MainActivity extends Activity implements SensorEventListener {
             // orientation. Undo the screen's own rotation so the image is upright in landscape.
             renderer.displayRotation = getWindowManager().getDefaultDisplay().getRotation();
 
-            // Field of view, so the panel lines up with the real world in the camera image.
+            // Field of view, so the windows line up with the real world in the camera image.
             float[] focals = cc.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
             SizeF phys = cc.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
             if (focals != null && focals.length > 0 && phys != null && focals[0] > 0) {
@@ -903,64 +920,71 @@ public class MainActivity extends Activity implements SensorEventListener {
         // Distance between the centres of the two Cardboard lenses, in millimetres.
         private static final float LENS_SEPARATION_MM = 63.9f;
 
+        // Windows: metres per texture pixel (80 cm wide), and distance from your eyes.
+        private static final float M_PER_PX = 0.80f / BrowserWindow.W;
+        private static final float WINDOW_DIST = 1.6f;
+        private static final float FOLLOW_SPEED = 3f;          // higher = catches up faster
+        private static final float FOLLOW_START = 0.35f;       // radians away before it follows (~20 deg)
+        private static final float FOLLOW_STOP = 0.04f;        // settles when this close
+        private static final float EYE_HALF_IPD = 0.032f;
+
+        // Set from the UI thread
         volatile boolean distortion = true;
         volatile int displayRotation = 1; // Surface.ROTATION_90
         volatile float eyeShift = 0.025f;   // fraction of camera width each eye is offset
         volatile float camAspect = 16f / 9f;
         volatile float tanHalfH = 0.62f;   // ~64 degrees horizontal, replaced by the real lens value
-        volatile float cursorU = 0.5f, cursorV = 0.3f, visibleFrac = (float) WEB_H / TEX_H;
-        volatile boolean pressed, recenter;
-        volatile boolean follow = true;    // smooth-follow mode; false = stays fixed (3DoF)
+        volatile boolean pressed, recenter, clearAnchors;
+        volatile boolean follow = true;    // smooth-follow mode; false = windows stay put
         volatile boolean useAr;            // 6DoF: ARCore supplies the camera and head pose
         volatile boolean arError;
+        volatile float cursorYaw, cursorPitch, dragPush;
+        volatile BrowserWindow pressWindow, dragWindow;
+
+        // Published for the UI thread: what the cursor is on, in texture pixels.
+        volatile BrowserWindow hitWindow;
+        volatile float hitX, hitY, pressX, pressY;
+
         private int arTexId;
         private final float[] arRight = new float[3], arUp = new float[3], arFwd = new float[3],
                 arPos = new float[3], arMatrix = new float[16], arCamInfo = {0.62f, 16f / 9f};
         private boolean arHavePose, arCameraLive, arLost;
-        // Anchor: where the panel is pinned in ARCore's map, and its facing direction in anchor space.
-        private boolean arAnchorPending;
-        private final float[] anchorLocalDir = new float[3];
         // Last good ARCore pose, with the rotation sensor's reading at that moment, so head turns
         // can still be followed (with the gyroscope) while ARCore has lost tracking.
         private final float[] arLastBasis = new float[9], sensorLastBasis = new float[9];
         private boolean arBridgeReady;
         private long lastHintMs;
 
-        // Panel: metres per texture pixel, and distance from your eyes.
-        private static final float PANEL_DIST = 1.6f;
-        private static final float M_PER_PX = 0.80f / WEB_W;   // panel is 80 cm wide
-        private static final float FOLLOW_SPEED = 3f;          // higher = catches up faster
-        private static final float FOLLOW_START = 0.35f;       // radians away before it follows (~20 deg)
-        private static final float FOLLOW_STOP = 0.04f;        // settles when this close
-        private static final float EYE_HALF_IPD = 0.032f;
-
         private final float[] rot = new float[9];
         private final float[] headPos = new float[3]; // metres; stays 0,0,0 in 3DoF
         private boolean haveRot;
-        // The panel lives at a fixed spot in the room (anchor) and faces back along panelDir.
-        private final float[] panelDir = new float[3];
-        private final float[] anchor = new float[3];
-        private boolean panelPlaced, following;
         private long lastNanos;
 
+        // This frame's head pose (render thread)
+        private float[] hRight = {1, 0, 0}, hUp = {0, 0, 1}, hFwd = {0, 1, 0};
+        private final float[] hPos = new float[3];
+        private float[] worldUp = {0f, 0f, 1f};
+        private final float[] cursorDir = new float[3], cursorWorld = new float[3];
+
+        // Moving a window (render thread)
+        private BrowserWindow dragging;
+        private float grabLx, grabLy, grabDist;
+        private BrowserWindow lastHitWin;
+        private float lastHitLx, lastHitLy, lastHitT;
+
         private final float xdpi;
-        private int program, texId, webTexId;
-        private SurfaceTexture surfaceTexture, webTexture;
+        private Prog camProg, winProg, curProg;
+        private int texId;
+        private SurfaceTexture surfaceTexture;
         private final float[] texMatrix = new float[16];
-        private final float[] webMatrix = new float[16];
         private int width, height;
         private final FloatBuffer quad;
-
-        private int aPos, uTexMatrix, uCenter, uAspect, uCrop, uShift, uDistort, uRot,
-                uTanH, uTanV, uHR, uHU, uHF, uPC, uPR, uPU, uPN, uEye, uPanel, uHalf,
-                uWebMatrix, uVis, uCursor, uPress, uHead, sTex, sWeb;
 
         StereoRenderer(float xdpi) {
             this.xdpi = xdpi > 0 ? xdpi : 400f;
             float[] v = {-1, -1, 1, -1, -1, 1, 1, 1};
             quad = ByteBuffer.allocateDirect(v.length * 4).order(ByteOrder.nativeOrder()).asFloatBuffer();
             quad.put(v).position(0);
-            android.opengl.Matrix.setIdentityM(webMatrix, 0);
         }
 
         synchronized void setHeadRotation(float[] r) {
@@ -970,7 +994,7 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         /**
          * Head position in metres, in the same world frame as the rotation (X east, Y north,
-         * Z up). Only a 6DoF tracker calls this; in 3DoF the head stays at the origin.
+         * Z up). Only a positional tracker would call this; in 3DoF the head stays at the origin.
          */
         synchronized void setHeadPosition(float x, float y, float z) {
             headPos[0] = x;
@@ -978,46 +1002,51 @@ public class MainActivity extends Activity implements SensorEventListener {
             headPos[2] = z;
         }
 
+        // ---------------------------------------------------------------- shaders
+
         private static final String VS =
                 "attribute vec2 aPos;\n" +
                 "varying vec2 vUv;\n" +
                 "void main(){ vUv = aPos*0.5+0.5; gl_Position = vec4(aPos,0.0,1.0); }";
 
-        // vUv: 0..1 across this eye's half of the screen.
-        // uCenter: where the lens centre sits inside that half.
-        // The pre-distortion (barrel) cancels the pincushion the Cardboard lens adds.
-        private static final String FS =
-                "#extension GL_OES_EGL_image_external : require\n" +
+        private static final String PRECISION =
                 "#ifdef GL_FRAGMENT_PRECISION_HIGH\n" +
                 "precision highp float;\n" +
                 "#else\n" +
                 "precision mediump float;\n" +
-                "#endif\n" +
+                "#endif\n";
+
+        // Shared by every pass: lens pre-distortion (cancels the Cardboard lens's pincushion)
+        // and turning a pixel into a view ray. vUv is 0..1 across this eye's half of the screen;
+        // uCenter is where the lens centre sits in it.
+        private static final String COMMON =
                 "varying vec2 vUv;\n" +
-                "uniform samplerExternalOES sTex;\n" +
-                "uniform samplerExternalOES sWeb;\n" +
-                "uniform mat4 uTexMatrix;\n" +
-                "uniform mat4 uWebMatrix;\n" +
                 "uniform vec2 uCenter;\n" +
-                "uniform float uAspect;\n" +
-                "uniform float uCrop;\n" +
-                "uniform float uShift;\n" +
-                "uniform float uDistort;\n" +
-                "uniform float uRot;\n" +
-                "uniform float uTanH, uTanV, uEye, uPanel, uVis, uPress;\n" +
-                "uniform vec3 uHR, uHU, uHF, uPC, uPR, uPU, uPN, uHead;\n" +
-                "uniform vec2 uHalf, uCursor;\n" +
-                "void main(){\n" +
+                "uniform float uAspect, uCrop, uShift, uDistort, uTanH, uTanV, uEye;\n" +
+                "uniform vec3 uHR, uHU, uHF, uHead;\n" +
+                "bool lensView(out vec2 c){\n" +
                 "  vec2 p = vUv - uCenter;\n" +
                 "  p.x *= uAspect;\n" +
-                "  if (uDistort > 0.5) {\n" +
-                "    float r2 = dot(p,p);\n" +
-                "    p *= (1.0 + 0.22*r2 + 0.24*r2*r2) * 0.82;\n" +
-                "  }\n" +
+                "  if (uDistort > 0.5) { float r2 = dot(p,p); p *= (1.0 + 0.22*r2 + 0.24*r2*r2) * 0.82; }\n" +
                 "  p.x /= uAspect;\n" +
                 "  vec2 uv = p + 0.5;\n" +
-                "  if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) { gl_FragColor = vec4(0.0,0.0,0.0,1.0); return; }\n" +
-                "  vec2 c = vec2(0.5 + (uv.x-0.5)*uCrop + uShift, uv.y);\n" +
+                "  c = vec2(0.5 + (uv.x-0.5)*uCrop + uShift, uv.y);\n" +
+                "  return uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;\n" +
+                "}\n" +
+                "vec3 viewDir(vec2 c){\n" +
+                "  vec2 tn = vec2((c.x-0.5)*2.0*uTanH, (c.y-0.5)*2.0*uTanV);\n" +
+                "  return normalize(tn.x*uHR + tn.y*uHU + uHF);\n" +
+                "}\n" +
+                "vec3 eyePos(){ return uHead + uEye*uHR; }\n";
+
+        private static final String CAM_FS =
+                "#extension GL_OES_EGL_image_external : require\n" + PRECISION + COMMON +
+                "uniform samplerExternalOES sTex;\n" +
+                "uniform mat4 uTexMatrix;\n" +
+                "uniform float uRot;\n" +
+                "void main(){\n" +
+                "  vec2 c;\n" +
+                "  if (!lensView(c)) { gl_FragColor = vec4(0.0,0.0,0.0,1.0); return; }\n" +
                 "  vec3 col = vec3(0.0);\n" +
                 "  if (c.x >= 0.0 && c.x <= 1.0) {\n" +
                 "    vec2 tc = c;\n" +
@@ -1026,40 +1055,81 @@ public class MainActivity extends Activity implements SensorEventListener {
                 "    else if (uRot > 2.5) tc = vec2(1.0 - c.y, c.x);\n" +
                 "    col = texture2D(sTex, (uTexMatrix*vec4(tc,0.0,1.0)).xy).rgb;\n" +
                 "  }\n" +
-                // Floating panel: trace this pixel's view ray into the world and hit the panel plane.
-                "  if (uPanel > 0.5) {\n" +
-                "    vec2 tn = vec2((c.x-0.5)*2.0*uTanH, (c.y-0.5)*2.0*uTanV);\n" +
-                "    vec3 dir = normalize(tn.x*uHR + tn.y*uHU + uHF);\n" +
-                "    vec3 o = uHead + uEye*uHR;\n" +
-                "    float den = dot(dir, uPN);\n" +
-                "    if (den < -0.0001) {\n" +
-                "      float t = dot(uPC - o, uPN) / den;\n" +
-                "      if (t > 0.0) {\n" +
-                "        vec3 h = o + dir*t - uPC;\n" +
-                "        vec2 l = vec2(dot(h, uPR), dot(h, uPU));\n" +
-                "        float rad = 0.02;\n" +
-                "        vec2 q = abs(l) - uHalf + rad;\n" +
-                "        float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rad;\n" +
-                "        float aa = 0.003 * t;\n" +
-                "        float fill = 1.0 - smoothstep(-aa, aa, d);\n" +
-                "        if (fill > 0.0) {\n" +
-                "          float tx = clamp(l.x / (2.0*uHalf.x) + 0.5, 0.0, 1.0);\n" +
-                "          float ty = clamp((uHalf.y - l.y) / (2.0*uHalf.y), 0.0, 1.0) * uVis;\n" +
-                "          vec3 page = texture2D(sWeb, (uWebMatrix*vec4(tx, 1.0-ty, 0.0, 1.0)).xy).rgb;\n" +
-                "          vec2 dpx = (vec2(tx, ty) - uCursor) * vec2(" + WEB_W + ".0, " + TEX_H + ".0);\n" +
-                "          float cd = length(dpx);\n" +
-                "          page = mix(page, vec3(0.08, 0.1, 0.14), 1.0 - smoothstep(9.0, 11.0, cd));\n" +
-                "          vec3 dotc = mix(vec3(1.0), vec3(0.3, 0.55, 1.0), uPress);\n" +
-                "          page = mix(page, dotc, 1.0 - smoothstep(6.0, 8.0, cd));\n" +
-                "          col = mix(col, page, fill);\n" +
-                "        }\n" +
-                "        float edge = 1.0 - smoothstep(0.0, aa * 1.5, abs(d + 0.002) - 0.0015);\n" +
-                "        col = mix(col, vec3(0.78, 0.92, 1.0), 0.6 * edge);\n" +
-                "      }\n" +
-                "    }\n" +
-                "  }\n" +
                 "  gl_FragColor = vec4(col, 1.0);\n" +
                 "}";
+
+        // One window: trace this pixel's view ray into the world and hit the window's plane.
+        private static final String WIN_FS =
+                "#extension GL_OES_EGL_image_external : require\n" + PRECISION + COMMON +
+                "uniform samplerExternalOES sWeb;\n" +
+                "uniform mat4 uWebMatrix;\n" +
+                "uniform vec3 uPC, uPR, uPU, uPN;\n" +
+                "uniform vec2 uHalf;\n" +
+                "uniform float uVis, uActive;\n" +
+                "void main(){\n" +
+                "  vec2 c;\n" +
+                "  if (!lensView(c)) discard;\n" +
+                "  vec3 dir = viewDir(c);\n" +
+                "  vec3 o = eyePos();\n" +
+                "  float den = dot(dir, uPN);\n" +
+                "  if (den > -0.0001) discard;\n" +
+                "  float t = dot(uPC - o, uPN) / den;\n" +
+                "  if (t <= 0.0) discard;\n" +
+                "  vec3 h = o + dir*t - uPC;\n" +
+                "  vec2 l = vec2(dot(h, uPR), dot(h, uPU));\n" +
+                "  float rad = 0.012;\n" +
+                "  vec2 q = abs(l) - uHalf + rad;\n" +
+                "  float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - rad;\n" +
+                "  float aa = 0.003 * t;\n" +
+                "  float fill = 1.0 - smoothstep(-aa, aa, d);\n" +
+                "  float edge = 1.0 - smoothstep(0.0, aa * 1.5, abs(d + 0.002) - 0.0015);\n" +
+                "  if (fill <= 0.0 && edge <= 0.0) discard;\n" +
+                "  float tx = clamp(l.x / (2.0*uHalf.x) + 0.5, 0.0, 1.0);\n" +
+                "  float ty = clamp((uHalf.y - l.y) / (2.0*uHalf.y), 0.0, 1.0) * uVis;\n" +
+                "  vec3 page = texture2D(sWeb, (uWebMatrix*vec4(tx, 1.0-ty, 0.0, 1.0)).xy).rgb;\n" +
+                "  vec3 ec = mix(vec3(0.78, 0.92, 1.0), vec3(0.35, 0.55, 1.0), uActive);\n" +
+                "  float ea = edge * mix(0.45, 0.95, uActive);\n" +
+                "  gl_FragColor = vec4(mix(page, ec, ea), max(fill, ea));\n" +
+                "}";
+
+        // The cursor: a dot at a point in the world (on the window it's over, or in mid-air).
+        private static final String CUR_FS =
+                PRECISION + COMMON +
+                "uniform vec3 uCursorPos;\n" +
+                "uniform float uPress;\n" +
+                "void main(){\n" +
+                "  vec2 c;\n" +
+                "  if (!lensView(c)) discard;\n" +
+                "  vec3 dir = viewDir(c);\n" +
+                "  vec3 n = normalize(uCursorPos - eyePos());\n" +
+                "  if (dot(dir, n) <= 0.0) discard;\n" +
+                "  float s = length(cross(dir, n));\n" + // angle from the cursor, in radians
+                "  float a = 1.0 - smoothstep(0.0085, 0.0100, s);\n" +
+                "  if (a <= 0.0) discard;\n" +
+                "  float inner = 1.0 - smoothstep(0.0055, 0.0070, s);\n" +
+                "  vec3 dotc = mix(vec3(1.0), vec3(0.3, 0.55, 1.0), uPress);\n" +
+                "  gl_FragColor = vec4(mix(vec3(0.08, 0.1, 0.14), dotc, inner), a);\n" +
+                "}";
+
+        /** A linked shader program, with its uniform locations looked up once. */
+        private class Prog {
+            final int id, aPos;
+            private final HashMap<String, Integer> locs = new HashMap<>();
+
+            Prog(String fs) {
+                id = link(VS, fs);
+                aPos = GLES20.glGetAttribLocation(id, "aPos");
+            }
+
+            int u(String name) {
+                Integer i = locs.get(name);
+                if (i == null) {
+                    i = GLES20.glGetUniformLocation(id, name);
+                    locs.put(name, i);
+                }
+                return i;
+            }
+        }
 
         private int newExternalTexture() {
             int[] t = new int[1];
@@ -1074,46 +1144,24 @@ public class MainActivity extends Activity implements SensorEventListener {
 
         @Override
         public void onSurfaceCreated(GL10 gl, EGLConfig config) {
-            program = link(VS, FS);
-            aPos = GLES20.glGetAttribLocation(program, "aPos");
-            uTexMatrix = GLES20.glGetUniformLocation(program, "uTexMatrix");
-            uWebMatrix = GLES20.glGetUniformLocation(program, "uWebMatrix");
-            uCenter = GLES20.glGetUniformLocation(program, "uCenter");
-            uAspect = GLES20.glGetUniformLocation(program, "uAspect");
-            uCrop = GLES20.glGetUniformLocation(program, "uCrop");
-            uShift = GLES20.glGetUniformLocation(program, "uShift");
-            uDistort = GLES20.glGetUniformLocation(program, "uDistort");
-            uRot = GLES20.glGetUniformLocation(program, "uRot");
-            uTanH = GLES20.glGetUniformLocation(program, "uTanH");
-            uTanV = GLES20.glGetUniformLocation(program, "uTanV");
-            uHR = GLES20.glGetUniformLocation(program, "uHR");
-            uHU = GLES20.glGetUniformLocation(program, "uHU");
-            uHF = GLES20.glGetUniformLocation(program, "uHF");
-            uPC = GLES20.glGetUniformLocation(program, "uPC");
-            uPR = GLES20.glGetUniformLocation(program, "uPR");
-            uPU = GLES20.glGetUniformLocation(program, "uPU");
-            uPN = GLES20.glGetUniformLocation(program, "uPN");
-            uEye = GLES20.glGetUniformLocation(program, "uEye");
-            uPanel = GLES20.glGetUniformLocation(program, "uPanel");
-            uHalf = GLES20.glGetUniformLocation(program, "uHalf");
-            uVis = GLES20.glGetUniformLocation(program, "uVis");
-            uCursor = GLES20.glGetUniformLocation(program, "uCursor");
-            uPress = GLES20.glGetUniformLocation(program, "uPress");
-            uHead = GLES20.glGetUniformLocation(program, "uHead");
-            sTex = GLES20.glGetUniformLocation(program, "sTex");
-            sWeb = GLES20.glGetUniformLocation(program, "sWeb");
+            camProg = new Prog(CAM_FS);
+            winProg = new Prog(WIN_FS);
+            curProg = new Prog(CUR_FS);
 
             texId = newExternalTexture();
-            webTexId = newExternalTexture();
             arTexId = newExternalTexture();
             arHavePose = false;
             surfaceTexture = new SurfaceTexture(texId);
-            webTexture = new SurfaceTexture(webTexId);
-            final SurfaceTexture st = surfaceTexture, wt = webTexture;
+            // A new GL context: every window needs a fresh texture.
+            for (BrowserWindow w : windows) {
+                w.texId = 0;
+                w.surfaceTexture = null;
+            }
+            final SurfaceTexture st = surfaceTexture;
             runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
-                    onTexturesReady(st, wt);
+                    onCameraTextureReady(st);
                 }
             });
         }
@@ -1124,12 +1172,54 @@ public class MainActivity extends Activity implements SensorEventListener {
             height = h;
         }
 
+        /** Gives a new window its texture, and frees the textures of closed ones. */
+        private void manageWindowTextures() {
+            BrowserWindow gone;
+            while ((gone = closedWindows.poll()) != null) {
+                if (gone.surfaceTexture != null) gone.surfaceTexture.release();
+                if (gone.texId != 0) GLES20.glDeleteTextures(1, new int[]{gone.texId}, 0);
+                if (gone.arAnchor >= 0 && tracker != null) tracker.releaseAnchor(gone.arAnchor);
+                gone.texId = 0;
+                gone.surfaceTexture = null;
+            }
+            for (final BrowserWindow w : windows) {
+                if (w.texId != 0) continue;
+                w.texId = newExternalTexture();
+                w.surfaceTexture = new SurfaceTexture(w.texId);
+                w.surfaceTexture.setDefaultBufferSize(BrowserWindow.W, BrowserWindow.TEX_H);
+                final Surface s = new Surface(w.surfaceTexture);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (windows.contains(w)) w.setSurface(s);
+                        else s.release();
+                    }
+                });
+            }
+        }
+
         @Override
         public void onDrawFrame(GL10 gl) {
             GLES20.glViewport(0, 0, width, height);
             GLES20.glClearColor(0, 0, 0, 1);
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
             if (surfaceTexture == null) return;
+
+            long now = System.nanoTime();
+            float dt = lastNanos == 0 ? 0f : Math.min(0.1f, (now - lastNanos) / 1e9f);
+            lastNanos = now;
+
+            if (clearAnchors) {
+                if (tracker != null) tracker.releaseAllAnchors();
+                for (BrowserWindow w : windows) {
+                    w.arAnchor = -1;
+                    w.arPending = false;
+                }
+                clearAnchors = false;
+            }
+            manageWindowTextures();
+
+            // Camera picture: from ARCore in 6DoF, otherwise from the camera directly.
             arCameraLive = false;
             if (useAr && tracker != null && !arError) {
                 int st = tracker.update(arTexId, displayRotation, arRight, arUp, arFwd, arPos, arMatrix, arCamInfo);
@@ -1165,56 +1255,115 @@ public class MainActivity extends Activity implements SensorEventListener {
                 tanHalfH = arCamInfo[0];
                 camAspect = arCamInfo[1];
             }
-            try {
-                webTexture.updateTexImage();
-                webTexture.getTransformMatrix(webMatrix);
-            } catch (RuntimeException e) {
-                // no browser frame yet
+            for (BrowserWindow w : windows) {
+                if (w.surfaceTexture == null) continue;
+                try {
+                    w.surfaceTexture.updateTexImage();
+                    w.surfaceTexture.getTransformMatrix(w.texMatrix);
+                } catch (RuntimeException e) {
+                    // no frame from this window yet
+                }
+            }
+
+            boolean poseOk = computeHead();
+            List<BrowserWindow> shown = new ArrayList<>();
+            if (poseOk) {
+                placeWindows(dt);
+                for (BrowserWindow w : windows) {
+                    if (w.placed && w.texId != 0) shown.add(w);
+                }
+                hitTest(shown);
+            } else {
+                hitWindow = null;
+            }
+            // Draw far windows first so nearer ones cover them.
+            final float[] dist = new float[shown.size()];
+            BrowserWindow[] order = shown.toArray(new BrowserWindow[0]);
+            for (int i = 0; i < order.length; i++) dist[i] = dist2(order[i].pc, hPos);
+            for (int i = 1; i < order.length; i++) {
+                for (int j = i; j > 0 && dist[j] > dist[j - 1]; j--) {
+                    float td = dist[j]; dist[j] = dist[j - 1]; dist[j - 1] = td;
+                    BrowserWindow tw = order[j]; order[j] = order[j - 1]; order[j - 1] = tw;
+                }
             }
 
             int half = width / 2;
             float eyeAspect = (float) half / height;
             // Show the camera's full height in each eye; crop the width to match the eye's shape.
             float crop = Math.min(1f, eyeAspect / camAspect);
-
             // Lens centres sit LENS_SEPARATION_MM apart around the middle of the screen.
             float lensPx = LENS_SEPARATION_MM / 25.4f * xdpi;
-            float leftCx = (half - lensPx / 2f) / half;   // within the left half, 0..1
-            float rightCx = (lensPx / 2f) / half;          // within the right half, 0..1
-            leftCx = Math.max(0.2f, Math.min(0.8f, leftCx));
-            rightCx = Math.max(0.2f, Math.min(0.8f, rightCx));
+            float leftCx = Math.max(0.2f, Math.min(0.8f, (half - lensPx / 2f) / half));
+            float rightCx = Math.max(0.2f, Math.min(0.8f, (lensPx / 2f) / half));
 
-            GLES20.glUseProgram(program);
-            GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, arCameraLive ? arTexId : texId);
-            GLES20.glUniform1i(sTex, 0);
-            GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
-            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, webTexId);
-            GLES20.glUniform1i(sWeb, 1);
-            GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, arCameraLive ? arMatrix : texMatrix, 0);
-            GLES20.glUniformMatrix4fv(uWebMatrix, 1, false, webMatrix, 0);
-            GLES20.glUniform1f(uAspect, eyeAspect);
-            GLES20.glUniform1f(uCrop, crop);
-            GLES20.glUniform1f(uDistort, distortion ? 1f : 0f);
-            GLES20.glUniform1f(uRot, arCameraLive ? 0f : (float) displayRotation); // ARCore's matrix already rotates
-            setPanelUniforms();
-            GLES20.glEnableVertexAttribArray(aPos);
-            GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad);
+            for (int eye = 0; eye < 2; eye++) {
+                if (eye == 0) GLES20.glViewport(0, 0, half, height);
+                else GLES20.glViewport(half, 0, width - half, height);
+                float cx = eye == 0 ? leftCx : rightCx;
+                // Left eye: its "camera" sits to the left, so it looks at a window shifted left.
+                float shift = eye == 0 ? -eyeShift : eyeShift;
+                float eyeOff = eye == 0 ? -EYE_HALF_IPD : EYE_HALF_IPD;
 
-            // Left eye: its "camera" sits to the left, so it looks at a window shifted left.
-            GLES20.glViewport(0, 0, half, height);
-            GLES20.glUniform2f(uCenter, leftCx, 0.5f);
-            GLES20.glUniform1f(uShift, -eyeShift);
-            GLES20.glUniform1f(uEye, -EYE_HALF_IPD);
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+                // 1. Camera picture
+                GLES20.glDisable(GLES20.GL_BLEND);
+                use(camProg, cx, eyeAspect, crop, shift, eyeOff);
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, arCameraLive ? arTexId : texId);
+                GLES20.glUniform1i(camProg.u("sTex"), 0);
+                GLES20.glUniformMatrix4fv(camProg.u("uTexMatrix"), 1, false, arCameraLive ? arMatrix : texMatrix, 0);
+                GLES20.glUniform1f(camProg.u("uRot"), arCameraLive ? 0f : (float) displayRotation); // ARCore's matrix already rotates
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
 
-            // Right eye
-            GLES20.glViewport(half, 0, width - half, height);
-            GLES20.glUniform2f(uCenter, rightCx, 0.5f);
-            GLES20.glUniform1f(uShift, eyeShift);
-            GLES20.glUniform1f(uEye, EYE_HALF_IPD);
-            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+                if (!poseOk) continue;
+                GLES20.glEnable(GLES20.GL_BLEND);
+                GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA);
+
+                // 2. Windows, far to near
+                use(winProg, cx, eyeAspect, crop, shift, eyeOff);
+                GLES20.glUniform1i(winProg.u("sWeb"), 1);
+                for (BrowserWindow w : order) {
+                    GLES20.glActiveTexture(GLES20.GL_TEXTURE1);
+                    GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, w.texId);
+                    GLES20.glUniformMatrix4fv(winProg.u("uWebMatrix"), 1, false, w.texMatrix, 0);
+                    GLES20.glUniform3f(winProg.u("uPC"), w.pc[0], w.pc[1], w.pc[2]);
+                    GLES20.glUniform3f(winProg.u("uPR"), w.pr[0], w.pr[1], w.pr[2]);
+                    GLES20.glUniform3f(winProg.u("uPU"), w.pu[0], w.pu[1], w.pu[2]);
+                    GLES20.glUniform3f(winProg.u("uPN"), -w.dir[0], -w.dir[1], -w.dir[2]);
+                    GLES20.glUniform2f(winProg.u("uHalf"), w.halfW, w.halfH);
+                    GLES20.glUniform1f(winProg.u("uVis"), w.visibleHeight / BrowserWindow.TEX_H);
+                    GLES20.glUniform1f(winProg.u("uActive"), w == active ? 1f : 0f);
+                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+                }
+
+                // 3. Cursor, on top
+                use(curProg, cx, eyeAspect, crop, shift, eyeOff);
+                GLES20.glUniform3f(curProg.u("uCursorPos"), cursorWorld[0], cursorWorld[1], cursorWorld[2]);
+                GLES20.glUniform1f(curProg.u("uPress"), pressed ? 1f : 0f);
+                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+            }
+            GLES20.glDisable(GLES20.GL_BLEND);
         }
+
+        /** Selects a program and sets what every pass shares for this eye. */
+        private void use(Prog p, float centerX, float eyeAspect, float crop, float shift, float eyeOff) {
+            GLES20.glUseProgram(p.id);
+            GLES20.glEnableVertexAttribArray(p.aPos);
+            GLES20.glVertexAttribPointer(p.aPos, 2, GLES20.GL_FLOAT, false, 0, quad);
+            GLES20.glUniform2f(p.u("uCenter"), centerX, 0.5f);
+            GLES20.glUniform1f(p.u("uAspect"), eyeAspect);
+            GLES20.glUniform1f(p.u("uCrop"), crop);
+            GLES20.glUniform1f(p.u("uShift"), shift);
+            GLES20.glUniform1f(p.u("uDistort"), distortion ? 1f : 0f);
+            GLES20.glUniform1f(p.u("uTanH"), tanHalfH);
+            GLES20.glUniform1f(p.u("uTanV"), tanHalfH / camAspect);
+            GLES20.glUniform1f(p.u("uEye"), eyeOff);
+            GLES20.glUniform3f(p.u("uHR"), hRight[0], hRight[1], hRight[2]);
+            GLES20.glUniform3f(p.u("uHU"), hUp[0], hUp[1], hUp[2]);
+            GLES20.glUniform3f(p.u("uHF"), hFwd[0], hFwd[1], hFwd[2]);
+            GLES20.glUniform3f(p.u("uHead"), hPos[0], hPos[1], hPos[2]);
+        }
+
+        // ---------------------------------------------------------------- head pose
 
         /** Saves the ARCore pose and the rotation sensor's reading taken at the same moment. */
         private void rememberTrackedPose() {
@@ -1270,12 +1419,8 @@ public class MainActivity extends Activity implements SensorEventListener {
             return new float[][]{right, up, neg(Z)};
         }
 
-        /** Works out where the head points, eases the panel toward it, and uploads both. */
-        private void setPanelUniforms() {
-            long now = System.nanoTime();
-            float dt = lastNanos == 0 ? 0f : Math.min(0.1f, (now - lastNanos) / 1e9f);
-            lastNanos = now;
-
+        /** Works out this frame's head pose. False if there's none yet. */
+        private boolean computeHead() {
             float[] r = new float[9];
             float[] head = new float[3];
             boolean ok;
@@ -1284,38 +1429,22 @@ public class MainActivity extends Activity implements SensorEventListener {
                 System.arraycopy(rot, 0, r, 0, 9);
                 System.arraycopy(headPos, 0, head, 0, 3);
             }
-            GLES20.glUniform1f(uTanH, tanHalfH);
-            GLES20.glUniform1f(uTanV, tanHalfH / camAspect);
-
-            float vis = visibleFrac;
-            float halfW = WEB_W * M_PER_PX / 2f;
-            float halfH = vis * TEX_H * M_PER_PX / 2f;
-            // Keep the top edge still while the keyboard slides out underneath.
-            float drop = halfH - WEB_H * M_PER_PX / 2f;
-            GLES20.glUniform2f(uHalf, halfW, halfH);
-            GLES20.glUniform1f(uVis, vis);
-            GLES20.glUniform2f(uCursor, cursorU, cursorV);
-            GLES20.glUniform1f(uPress, pressed ? 1f : 0f);
             boolean sensorOk = ok;
             boolean ar = useAr;
             if (ar) {
                 ok = arHavePose;
                 System.arraycopy(arPos, 0, head, 0, 3);
             }
-            if (!ok) {
-                GLES20.glUniform1f(uPanel, 0f);
-                return;
-            }
+            if (!ok) return false;
 
             float[][] sb = sensorBasis(r);
             float[] right = sb[0], up = sb[1], fwd = sb[2];
             // Which way is up in this world: +Z for the rotation sensor, +Y for ARCore.
-            float[] worldUp = {0f, 0f, 1f};
+            worldUp = ar ? new float[]{0f, 1f, 0f} : new float[]{0f, 0f, 1f};
             if (ar) {
-                worldUp = new float[]{0f, 1f, 0f};
                 if (arLost && arBridgeReady && sensorOk) {
                     // ARCore lost tracking: turn its last pose by however far the gyroscope
-                    // says the head has turned since, so the panel doesn't stick to your face.
+                    // says the head has turned since, so windows don't stick to your face.
                     float[] sNow = new float[9];
                     putBasis(sNow, sb[0], sb[1], sb[2]);
                     float[] aNow = new float[9];
@@ -1336,73 +1465,226 @@ public class MainActivity extends Activity implements SensorEventListener {
                     fwd = arFwd.clone();
                 }
             }
+            hRight = right;
+            hUp = up;
+            hFwd = fwd;
+            System.arraycopy(head, 0, hPos, 0, 3);
 
-            if (!panelPlaced || recenter) {
-                // Reset: put the panel straight ahead of wherever your head is now.
-                System.arraycopy(fwd, 0, panelDir, 0, 3);
-                for (int i = 0; i < 3; i++) anchor[i] = head[i] + fwd[i] * PANEL_DIST;
-                panelPlaced = true;
+            // Cursor: an angle away from straight ahead.
+            float ty = (float) Math.tan(cursorYaw), tp = (float) Math.tan(cursorPitch);
+            for (int i = 0; i < 3; i++) cursorDir[i] = fwd[i] + right[i] * ty + up[i] * tp;
+            norm(cursorDir);
+            return true;
+        }
+
+        // ---------------------------------------------------------------- window placement
+
+        /** Turns a direction to the right (negative = left) around the vertical. */
+        private float[] turn(float[] d, float radians) {
+            float[] right = cross(d, worldUp);
+            if (len(right) < 0.05f) right = hRight.clone();
+            norm(right);
+            float c = (float) Math.cos(radians), s = (float) Math.sin(radians);
+            float[] out = {d[0] * c + right[0] * s, d[1] * c + right[1] * s, d[2] * c + right[2] * s};
+            norm(out);
+            return out;
+        }
+
+        private void placeAt(BrowserWindow w, float[] d, float distance, boolean ar) {
+            System.arraycopy(d, 0, w.dir, 0, 3);
+            for (int i = 0; i < 3; i++) w.anchor[i] = hPos[i] + d[i] * distance;
+            w.placed = true;
+            w.following = false;
+            if (w.arAnchor >= 0 && tracker != null) tracker.releaseAnchor(w.arAnchor);
+            w.arAnchor = -1;
+            w.arPending = ar && !follow; // pin it in ARCore's map so it doesn't slide
+        }
+
+        private void placeWindows(float dt) {
+            boolean ar = useAr;
+            BrowserWindow act = active;
+
+            if (recenter) {
+                // Active window straight ahead; the others fanned out to its sides.
                 recenter = false;
-                following = false;
-                arAnchorPending = ar; // pin it in ARCore's map so it doesn't slide
-            } else if (follow) {
-                // Smooth follow: stay put while you look around the panel, glide back
-                // once you look well away, and keep the same distance if you move (6DoF).
-                float[] toPanel = new float[3];
-                for (int i = 0; i < 3; i++) toPanel[i] = anchor[i] - head[i];
-                norm(toPanel);
-                float cos = toPanel[0] * fwd[0] + toPanel[1] * fwd[1] + toPanel[2] * fwd[2];
+                List<BrowserWindow> list = new ArrayList<>(windows);
+                if (act != null && list.remove(act)) list.add(0, act);
+                float[] offsets = {0f, 0.61f, -0.61f, 1.22f, -1.22f}; // 0, +-35, +-70 degrees
+                for (int i = 0; i < list.size(); i++) {
+                    placeAt(list.get(i), turn(hFwd, offsets[Math.min(i, offsets.length - 1)]), WINDOW_DIST, ar);
+                }
+            }
+            for (BrowserWindow w : windows) {
+                if (w.placed) continue;
+                // New window: just in front of where you're looking, a little nearer than the
+                // others so it shows on top.
+                placeAt(w, hFwd, WINDOW_DIST - 0.15f, ar);
+            }
+
+            // Moving a window: keep the spot you grabbed under the cursor.
+            BrowserWindow dw = dragWindow;
+            if (dw != null && !windows.contains(dw)) dw = null;
+            if (dw != null) {
+                if (dragging != dw) {
+                    dragging = dw;
+                    if (lastHitWin == dw) {
+                        grabLx = lastHitLx;
+                        grabLy = lastHitLy;
+                        grabDist = lastHitT;
+                    } else {
+                        grabLx = 0f;
+                        grabLy = 0f;
+                        grabDist = (float) Math.sqrt(dist2(dw.pc, hPos));
+                    }
+                    if (dw.arAnchor >= 0 && tracker != null) tracker.releaseAnchor(dw.arAnchor);
+                    dw.arAnchor = -1;
+                    dw.arPending = false;
+                    dw.following = false;
+                }
+                grabDist = Math.max(0.5f, Math.min(4f, grabDist + dragPush * dt));
+                float[] p = new float[3];
+                for (int i = 0; i < 3; i++) p[i] = hPos[i] + cursorDir[i] * grabDist;
+                float[] c = p.clone();
+                for (int k = 0; k < 2; k++) {
+                    float[] d = new float[3];
+                    for (int i = 0; i < 3; i++) d[i] = c[i] - hPos[i];
+                    norm(d);
+                    float[][] axes = windowAxes(d);
+                    for (int i = 0; i < 3; i++) c[i] = p[i] - axes[0][i] * grabLx - axes[1][i] * grabLy;
+                }
+                // c is the centre as drawn; the anchor is the centre without the keyboard.
+                float drop = (dw.visibleHeight - BrowserWindow.BASE_H) * M_PER_PX / 2f;
+                float[] d = new float[3];
+                for (int i = 0; i < 3; i++) d[i] = c[i] - hPos[i];
+                norm(d);
+                float[] pu = windowAxes(d)[1];
+                for (int i = 0; i < 3; i++) dw.anchor[i] = c[i] + pu[i] * drop;
+                System.arraycopy(d, 0, dw.dir, 0, 3);
+            } else if (dragging != null) {
+                // Let go: in 6DoF, pin it where it was dropped.
+                dragging.arPending = ar && !follow;
+                dragging = null;
+            }
+
+            // Smooth follow: the active window glides back in front once you look well away.
+            if (follow && act != null && act.placed && act != dw) {
+                float[] toWin = new float[3];
+                for (int i = 0; i < 3; i++) toWin[i] = act.anchor[i] - hPos[i];
+                float distance = len(toWin);
+                norm(toWin);
+                float cos = toWin[0] * hFwd[0] + toWin[1] * hFwd[1] + toWin[2] * hFwd[2];
                 float angle = (float) Math.acos(Math.max(-1f, Math.min(1f, cos)));
-                if (angle > FOLLOW_START) following = true;
-                float a = 1f - (float) Math.exp(-dt * FOLLOW_SPEED);
-                if (following) {
-                    for (int i = 0; i < 3; i++) panelDir[i] += (fwd[i] - panelDir[i]) * a;
-                    norm(panelDir);
-                    if (angle < FOLLOW_STOP) following = false;
+                if (angle > FOLLOW_START) act.following = true;
+                if (act.following) {
+                    float a = 1f - (float) Math.exp(-dt * FOLLOW_SPEED);
+                    for (int i = 0; i < 3; i++) act.dir[i] += (hFwd[i] - act.dir[i]) * a;
+                    norm(act.dir);
+                    for (int i = 0; i < 3; i++) {
+                        float target = hPos[i] + act.dir[i] * distance;
+                        act.anchor[i] += (target - act.anchor[i]) * a;
+                    }
+                    if (angle < FOLLOW_STOP) act.following = false;
                 }
-                for (int i = 0; i < 3; i++) {
-                    float target = head[i] + panelDir[i] * PANEL_DIST;
-                    anchor[i] += (target - anchor[i]) * a;
-                }
-            } else {
-                // 3DoF / 6DoF: the panel stays where it is in the room.
-                following = false;
             }
 
-            if (ar && !follow) {
-                if (arAnchorPending && !arLost
-                        && tracker.setAnchor(anchor[0], anchor[1], anchor[2])) {
-                    System.arraycopy(panelDir, 0, anchorLocalDir, 0, 3);
-                    arAnchorPending = false;
-                }
-                // Follow the anchor as ARCore refines its map of the room.
+            // 6DoF: keep each window pinned to ARCore's map of the room.
+            if (ar && !follow && tracker != null) {
                 float[] p = new float[3], d = new float[3];
-                if (!arAnchorPending && tracker.getAnchor(anchorLocalDir, p, d)) {
-                    System.arraycopy(p, 0, anchor, 0, 3);
-                    System.arraycopy(d, 0, panelDir, 0, 3);
-                    norm(panelDir);
+                for (BrowserWindow w : windows) {
+                    if (w == dw) continue;
+                    if (w.arPending && !arLost) {
+                        int h = tracker.createAnchor(w.anchor[0], w.anchor[1], w.anchor[2]);
+                        if (h >= 0) {
+                            w.arAnchor = h;
+                            System.arraycopy(w.dir, 0, w.arLocalDir, 0, 3);
+                            w.arPending = false;
+                        }
+                    }
+                    if (w.arAnchor >= 0 && tracker.getAnchor(w.arAnchor, w.arLocalDir, p, d)) {
+                        System.arraycopy(p, 0, w.anchor, 0, 3);
+                        System.arraycopy(d, 0, w.dir, 0, 3);
+                        norm(w.dir);
+                    }
                 }
             }
 
-            // Keep the panel level with the horizon.
-            float[] pr = cross(panelDir, worldUp);
-            if (len(pr) < 0.05f) pr = right.clone(); // looking straight up or down
+            // Final shape and position of each window this frame.
+            for (BrowserWindow w : windows) {
+                if (!w.placed) continue;
+                float[][] axes = windowAxes(w.dir);
+                System.arraycopy(axes[0], 0, w.pr, 0, 3);
+                System.arraycopy(axes[1], 0, w.pu, 0, 3);
+                float vis = w.visibleHeight;
+                w.halfW = BrowserWindow.W * M_PER_PX / 2f;
+                w.halfH = vis * M_PER_PX / 2f;
+                // Keep the top edge still while the keyboard slides out underneath.
+                float drop = (vis - BrowserWindow.BASE_H) * M_PER_PX / 2f;
+                for (int i = 0; i < 3; i++) w.pc[i] = w.anchor[i] - w.pu[i] * drop;
+            }
+        }
+
+        /** A window's right and up directions: level with the horizon, facing back along d. */
+        private float[][] windowAxes(float[] d) {
+            float[] pr = cross(d, worldUp);
+            if (len(pr) < 0.05f) pr = hRight.clone(); // looking straight up or down
             norm(pr);
-            float[] pu = cross(pr, panelDir);
+            float[] pu = cross(pr, d);
             norm(pu);
+            return new float[][]{pr, pu};
+        }
 
-            float[] pc = new float[3];
-            for (int i = 0; i < 3; i++) pc[i] = anchor[i] - pu[i] * drop;
+        // ---------------------------------------------------------------- cursor
 
-            GLES20.glUniform1f(uPanel, 1f);
-            GLES20.glUniform3f(uHead, head[0], head[1], head[2]);
-            GLES20.glUniform3f(uHR, right[0], right[1], right[2]);
-            GLES20.glUniform3f(uHU, up[0], up[1], up[2]);
-            GLES20.glUniform3f(uHF, fwd[0], fwd[1], fwd[2]);
-            GLES20.glUniform3f(uPC, pc[0], pc[1], pc[2]);
-            GLES20.glUniform3f(uPR, pr[0], pr[1], pr[2]);
-            GLES20.glUniform3f(uPU, pu[0], pu[1], pu[2]);
-            GLES20.glUniform3f(uPN, -panelDir[0], -panelDir[1], -panelDir[2]);
+        /** Finds the nearest window under the cursor, and where on it, for the UI thread. */
+        private void hitTest(List<BrowserWindow> shown) {
+            BrowserWindow best = null;
+            float bestT = Float.MAX_VALUE, bestLx = 0, bestLy = 0;
+            BrowserWindow pw = pressWindow;
+            for (BrowserWindow w : shown) {
+                float[] n = {-w.dir[0], -w.dir[1], -w.dir[2]};
+                float den = cursorDir[0] * n[0] + cursorDir[1] * n[1] + cursorDir[2] * n[2];
+                if (den > -0.0001f) continue;
+                float t = ((w.pc[0] - hPos[0]) * n[0] + (w.pc[1] - hPos[1]) * n[1] + (w.pc[2] - hPos[2]) * n[2]) / den;
+                if (t <= 0f) continue;
+                float[] h = new float[3];
+                for (int i = 0; i < 3; i++) h[i] = hPos[i] + cursorDir[i] * t - w.pc[i];
+                float lxw = h[0] * w.pr[0] + h[1] * w.pr[1] + h[2] * w.pr[2];
+                float lyw = h[0] * w.pu[0] + h[1] * w.pu[1] + h[2] * w.pu[2];
+                if (w == pw) {
+                    // While pressing, keep tracking this window's surface even off its edge.
+                    pressX = clamp((lxw / (2f * w.halfW) + 0.5f) * BrowserWindow.W, 0f, BrowserWindow.W - 1f);
+                    pressY = clamp((w.halfH - lyw) / (2f * w.halfH) * w.visibleHeight, 0f, w.visibleHeight - 1f);
+                }
+                if (Math.abs(lxw) <= w.halfW && Math.abs(lyw) <= w.halfH && t < bestT) {
+                    best = w;
+                    bestT = t;
+                    bestLx = lxw;
+                    bestLy = lyw;
+                }
+            }
+            if (best != null) {
+                hitX = clamp((bestLx / (2f * best.halfW) + 0.5f) * BrowserWindow.W, 0f, BrowserWindow.W - 1f);
+                hitY = clamp((best.halfH - bestLy) / (2f * best.halfH) * best.visibleHeight, 0f, best.visibleHeight - 1f);
+                lastHitLx = bestLx;
+                lastHitLy = bestLy;
+                lastHitT = bestT;
+                for (int i = 0; i < 3; i++) cursorWorld[i] = hPos[i] + cursorDir[i] * bestT;
+            } else {
+                for (int i = 0; i < 3; i++) cursorWorld[i] = hPos[i] + cursorDir[i] * WINDOW_DIST;
+            }
+            lastHitWin = best;
+            hitWindow = best;
+        }
+
+        // ---------------------------------------------------------------- maths
+
+        private float clamp(float v, float lo, float hi) {
+            return Math.max(lo, Math.min(hi, v));
+        }
+
+        private float dist2(float[] a, float[] b) {
+            float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+            return x * x + y * y + z * z;
         }
 
         private float[] neg(float[] v) {

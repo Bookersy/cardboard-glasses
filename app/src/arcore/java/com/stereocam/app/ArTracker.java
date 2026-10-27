@@ -24,7 +24,8 @@ public class ArTracker implements SixDofTracker {
     private int geometryRotation = -1;
     private volatile String error;
     private volatile String hint;
-    private Anchor anchor;
+    private final java.util.HashMap<Integer, Anchor> anchors = new java.util.HashMap<>();
+    private int nextHandle = 1;
 
     @Override
     public String unsupportedReason(Activity a) {
@@ -93,22 +94,22 @@ public class ArTracker implements SixDofTracker {
     }
 
     @Override
-    public boolean setAnchor(float x, float y, float z) {
+    public int createAnchor(float x, float y, float z) {
         Session s = session;
-        if (s == null) return false;
+        if (s == null) return -1;
         try {
             Anchor a = s.createAnchor(new Pose(new float[]{x, y, z}, new float[]{0f, 0f, 0f, 1f}));
-            if (anchor != null) anchor.detach();
-            anchor = a;
-            return true;
+            int h = nextHandle++;
+            anchors.put(h, a);
+            return h;
         } catch (Exception e) {
-            return false; // usually "not tracking yet"; the caller retries
+            return -1; // usually "not tracking yet"; the caller retries
         }
     }
 
     @Override
-    public boolean getAnchor(float[] localDir, float[] outPos, float[] outDir) {
-        Anchor a = anchor;
+    public boolean getAnchor(int handle, float[] localDir, float[] outPos, float[] outDir) {
+        Anchor a = anchors.get(handle);
         if (a == null || a.getTrackingState() != TrackingState.TRACKING) return false;
         Pose p = a.getPose();
         outPos[0] = p.tx();
@@ -120,76 +121,14 @@ public class ArTracker implements SixDofTracker {
     }
 
     @Override
-    public int update(int cameraTexture, int displayRotation,
-                      float[] right, float[] up, float[] fwd, float[] pos,
-                      float[] texMatrix, float[] camInfo) {
-        Session s = session;
-        if (s == null) return NO_FRAME;
-        try {
-            if (boundTexture != cameraTexture) {
-                s.setCameraTextureName(cameraTexture);
-                boundTexture = cameraTexture;
-            }
-            if (geometryRotation != displayRotation) {
-                // Use the camera's own shape as the "view", so view coordinates cover the whole picture.
-                Size ts = s.getCameraConfig().getTextureSize();
-                int w = Math.max(ts.getWidth(), ts.getHeight()), h = Math.min(ts.getWidth(), ts.getHeight());
-                s.setDisplayGeometry(displayRotation, w, h);
-                geometryRotation = displayRotation;
-            }
+    public void releaseAnchor(int handle) {
+        Anchor a = anchors.remove(handle);
+        if (a != null) a.detach();
+    }
 
-            Frame f = s.update();
-            Camera cam = f.getCamera();
-
-            // Map view coordinates (origin top-left, y down) onto the camera texture. We sample
-            // with c = (x, y up), so view = (c.x, 1 - c.y). The mapping is affine; find it from 3 points.
-            float[] view = {0f, 0f, 1f, 0f, 0f, 1f};
-            float[] tex = new float[6];
-            f.transformCoordinates2d(Coordinates2d.VIEW_NORMALIZED, view, Coordinates2d.TEXTURE_NORMALIZED, tex);
-            float t0x = tex[0], t0y = tex[1], t1x = tex[2], t1y = tex[3], t2x = tex[4], t2y = tex[5];
-            // tex(c) = T2 + (T1 - T0) * c.x - (T2 - T0) * c.y   (column-major mat4)
-            java.util.Arrays.fill(texMatrix, 0f);
-            texMatrix[0] = t1x - t0x;
-            texMatrix[1] = t1y - t0y;
-            texMatrix[4] = -(t2x - t0x);
-            texMatrix[5] = -(t2y - t0y);
-            texMatrix[10] = 1f;
-            texMatrix[12] = t2x;
-            texMatrix[13] = t2y;
-            texMatrix[15] = 1f;
-
-            CameraIntrinsics in = cam.getTextureIntrinsics();
-            float[] fl = in.getFocalLength();
-            int[] dims = in.getImageDimensions();
-            if (dims[0] >= dims[1]) {
-                camInfo[0] = (dims[0] / 2f) / fl[0];
-                camInfo[1] = (float) dims[0] / dims[1];
-            } else {
-                camInfo[0] = (dims[1] / 2f) / fl[1];
-                camInfo[1] = (float) dims[1] / dims[0];
-            }
-
-            if (cam.getTrackingState() != TrackingState.TRACKING) {
-                hint = describe(cam.getTrackingFailureReason());
-                return CAMERA_ONLY;
-            }
-            hint = null;
-
-            // Display-oriented pose: X right, Y up, -Z forward for how the screen is held.
-            Pose p = cam.getDisplayOrientedPose();
-            float[] x = p.getXAxis(), y = p.getYAxis(), z = p.getZAxis();
-            for (int i = 0; i < 3; i++) {
-                right[i] = x[i];
-                up[i] = y[i];
-                fwd[i] = -z[i];
-            }
-            pos[0] = p.tx();
-            pos[1] = p.ty();
-            pos[2] = p.tz();
-            return TRACKING;
-        } catch (Exception e) {
-            error = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
-            return FAILED;
-        }
+    @Override
+    public void releaseAllAnchors() {
+        for (Anchor a : anchors.values()) a.detach();
+        anchors.clear();
     }
 }

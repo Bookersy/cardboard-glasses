@@ -39,15 +39,21 @@ public interface SixDofTracker {
     String trackingHint();
 
     /**
-     * Pins a point in the room (GL thread). The tracker keeps it attached to the real
-     * world as its map improves, so things placed there don't slide. False if it can't
+     * Pins a point in the room (GL thread). The tracker keeps it attached to the real world as
+     * its map improves, so things placed there don't slide. Returns a handle, or -1 if it can't
      * place one right now (e.g. not tracking); try again later.
      */
-    boolean setAnchor(float x, float y, float z);
+    int createAnchor(float x, float y, float z);
 
     /**
-     * Current position of the pinned point, and localDir turned by however the tracker has
-     * corrected it since. False if there's no anchor or it isn't being tracked.
+     * Current position of a pinned point, and localDir turned by however the tracker has
+     * corrected it since. False if the anchor isn't being tracked right now.
      */
-    boolean getAnchor(float[] localDir, float[] outPos, float[] outDir);
+    boolean getAnchor(int handle, float[] localDir, float[] outPos, float[] outDir);
+
+    /** Stops tracking a pinned point. */
+    void releaseAnchor(int handle);
+
+    /** Stops tracking all pinned points. */
+    void releaseAllAnchors();
 }
