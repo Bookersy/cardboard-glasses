@@ -97,7 +97,7 @@ public class VrKeyboard extends View {
         if (w == laidOutW && h == laidOutH) return;
         laidOutW = w;
         laidOutH = h;
-        float pad = 8f;
+        float pad = 8f * h / 300f; // keeps proportions at any layout size
         float rowH = (h - pad) / rows.size();
         float unit = (w - pad) / 10f;
         for (int r = 0; r < rows.size(); r++) {
@@ -181,7 +181,7 @@ public class VrKeyboard extends View {
     protected void onDraw(Canvas c) {
         layoutKeys();
         c.drawColor(0xFF1A1E26);
-        float rr = 10f;
+        float rr = 10f * getHeight() / 300f;
         for (List<Key> row : rows) {
             for (Key k : row) {
                 int color;

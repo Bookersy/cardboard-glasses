@@ -13,10 +13,17 @@ import android.widget.FrameLayout;
 public class PanelHost extends FrameLayout {
 
     private Surface surface;
+    private float drawScale = 1f;
 
     public PanelHost(Context context) {
         super(context);
         setWillNotDraw(false);
+    }
+
+    /** Children lay out larger than the texture (for a desktop-width page); shrink them when drawing. */
+    public void setDrawScale(float s) {
+        drawScale = s;
+        invalidate();
     }
 
     public synchronized void setSurface(Surface s) {
@@ -37,7 +44,10 @@ public class PanelHost extends FrameLayout {
         try {
             c = s.lockHardwareCanvas();
             c.drawColor(Color.WHITE);
+            c.save();
+            c.scale(drawScale, drawScale);
             super.draw(c);
+            c.restore();
         } catch (RuntimeException e) {
             // Surface went away mid-frame (app pausing); the next frame redraws.
         } finally {

@@ -78,6 +78,10 @@ public class MainActivity extends Activity implements SensorEventListener {
 
     // Panel texture layout, in pixels: the page on top, the keyboard underneath.
     static final int WEB_W = 1024, WEB_H = 640, KB_H = 300, TEX_H = WEB_H + KB_H;
+    // Pages are laid out this many CSS pixels wide (like a small laptop), then scaled onto the panel.
+    // Laying out at the phone's own density gave a ~370px-wide phone page with huge text.
+    private static final float PAGE_CSS_WIDTH = 900f;
+    private float layoutScale = 1f; // view pixels per panel-texture pixel
 
     private GLSurfaceView glView;
     private StereoRenderer renderer;
@@ -154,12 +158,14 @@ public class MainActivity extends Activity implements SensorEventListener {
                 handleKeyboardKey(type, text);
             }
         });
-        FrameLayout.LayoutParams wl = new FrameLayout.LayoutParams(WEB_W, WEB_H);
+        layoutScale = Math.max(1f, getResources().getDisplayMetrics().density * PAGE_CSS_WIDTH / WEB_W);
+        host.setDrawScale(1f / layoutScale);
+        FrameLayout.LayoutParams wl = new FrameLayout.LayoutParams(px(WEB_W), px(WEB_H));
         host.addView(web, wl);
-        FrameLayout.LayoutParams kl = new FrameLayout.LayoutParams(WEB_W, KB_H);
-        kl.topMargin = WEB_H;
+        FrameLayout.LayoutParams kl = new FrameLayout.LayoutParams(px(WEB_W), px(KB_H));
+        kl.topMargin = px(WEB_H);
         host.addView(keyboard, kl);
-        root.addView(host, new FrameLayout.LayoutParams(WEB_W, TEX_H));
+        root.addView(host, new FrameLayout.LayoutParams(px(WEB_W), px(TEX_H)));
 
         glView = new GLSurfaceView(this);
         glView.setEGLContextClientVersion(2);
@@ -262,6 +268,11 @@ public class MainActivity extends Activity implements SensorEventListener {
         if (!anyGamepadConnected()) {
             toast("Pair your controller in Bluetooth settings to use the browser");
         }
+    }
+
+    /** Panel-texture pixels to view pixels. */
+    private int px(float texturePx) {
+        return Math.round(texturePx * layoutScale);
     }
 
     // ------------------------------------------------------------------ browser
@@ -547,7 +558,8 @@ public class MainActivity extends Activity implements SensorEventListener {
     }
 
     private void sendTouch(int action) {
-        MotionEvent ev = MotionEvent.obtain(touchDownTime, SystemClock.uptimeMillis(), action, cursorX, cursorY, 0);
+        MotionEvent ev = MotionEvent.obtain(touchDownTime, SystemClock.uptimeMillis(), action,
+                cursorX * layoutScale, cursorY * layoutScale, 0);
         ev.setSource(InputDevice.SOURCE_TOUCHSCREEN);
         if (cursorY < WEB_H) web.requestFocus();
         host.dispatchTouchEvent(ev);
@@ -571,8 +583,8 @@ public class MainActivity extends Activity implements SensorEventListener {
         pp[0].id = 0;
         pp[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
         MotionEvent.PointerCoords[] pc = {new MotionEvent.PointerCoords()};
-        pc[0].x = cursorX;
-        pc[0].y = cursorY;
+        pc[0].x = cursorX * layoutScale;
+        pc[0].y = cursorY * layoutScale;
         pc[0].setAxisValue(MotionEvent.AXIS_VSCROLL, v);
         pc[0].setAxisValue(MotionEvent.AXIS_HSCROLL, h);
         MotionEvent ev = MotionEvent.obtain(t, t, MotionEvent.ACTION_SCROLL, 1, pp, pc,
@@ -614,7 +626,7 @@ public class MainActivity extends Activity implements SensorEventListener {
             float sv = shape(-ry), sh = shape(rx);
             if ((sv != 0f || sh != 0f) && cursorY < WEB_H && !touching) sendScroll(sv * 0.6f, sh * 0.6f);
 
-            if (keyboardWanted && cursorY >= WEB_H) keyboard.setHover(cursorX, cursorY - WEB_H);
+            if (keyboardWanted && cursorY >= WEB_H) keyboard.setHover(cursorX * layoutScale, (cursorY - WEB_H) * layoutScale);
             else keyboard.setHover(-1, -1);
 
             renderer.cursorU = cursorX / WEB_W;
@@ -888,8 +900,8 @@ public class MainActivity extends Activity implements SensorEventListener {
         private long lastHintMs;
 
         // Panel: metres per texture pixel, and distance from your eyes.
-        private static final float PANEL_DIST = 1.5f;
-        private static final float M_PER_PX = 0.96f / WEB_W;
+        private static final float PANEL_DIST = 1.6f;
+        private static final float M_PER_PX = 0.80f / WEB_W;   // panel is 80 cm wide
         private static final float FOLLOW_SPEED = 3f;          // higher = catches up faster
         private static final float FOLLOW_START = 0.35f;       // radians away before it follows (~20 deg)
         private static final float FOLLOW_STOP = 0.04f;        // settles when this close
