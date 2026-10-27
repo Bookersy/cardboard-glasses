@@ -28,8 +28,6 @@ public class SettingsOverlay extends FrameLayout {
 
         void onTrackingChanged(int mode);
 
-        void onCameraTrackingChanged(boolean on);
-
         void onClose();
     }
 
@@ -40,11 +38,9 @@ public class SettingsOverlay extends FrameLayout {
     private boolean lens;
     private float eyeShift;
     private int mode;
-    private boolean cameraTracking;
-    private String arcoreUnavailable; // null when ARCore camera tracking can be used
+    private String sixDofUnavailable; // null when 6DoF can be used
 
-    private TextView mode3, mode6, modeF, lensOn, lensOff, sepValue, note, camLabel, camOff, camOn;
-    private LinearLayout camRow;
+    private TextView mode3, mode6, modeF, lensOn, lensOff, sepValue, note;
     private SeekBar sep;
 
     public SettingsOverlay(Context c, Callbacks cb) {
@@ -114,40 +110,15 @@ public class SettingsOverlay extends FrameLayout {
         mode6.setOnClickListener(new OnClickListener() {
             @Override
             public void onClick(View v) {
-                mode = MODE_6DOF;
-                refresh();
-                SettingsOverlay.this.cb.onTrackingChanged(mode);
-            }
-        });
-
-        // Only shown in 6DoF: optionally use the camera (ARCore) instead of the motion sensors.
-        camLabel = label("CAMERA TRACKING (ARCORE)");
-        card.addView(camLabel);
-        camRow = segRow();
-        camOff = segItem("Off \u00B7 motion sensors");
-        camOn = segItem("On \u00B7 ARCore");
-        camRow.addView(camOff, segLp());
-        camRow.addView(camOn, segLp());
-        card.addView(camRow);
-        camOff.setOnClickListener(new OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                cameraTracking = false;
-                refresh();
-                SettingsOverlay.this.cb.onCameraTrackingChanged(false);
-            }
-        });
-        camOn.setOnClickListener(new OnClickListener() {
-            @Override
-            public void onClick(View v) {
-                if (arcoreUnavailable != null) {
-                    note.setText(arcoreUnavailable);
+                if (sixDofUnavailable != null) {
+                    // Not possible here: explain instead of switching.
+                    note.setText(sixDofUnavailable);
                     note.setTextColor(0xFFFFB86B);
                     return;
                 }
-                cameraTracking = true;
+                mode = MODE_6DOF;
                 refresh();
-                SettingsOverlay.this.cb.onCameraTrackingChanged(true);
+                SettingsOverlay.this.cb.onTrackingChanged(mode);
             }
         });
 
@@ -212,9 +183,8 @@ public class SettingsOverlay extends FrameLayout {
         addView(scroll, lp);
     }
 
-    public void setValues(boolean lens, float eyeShift, int mode, boolean cameraTracking, String arcoreUnavailable) {
-        this.cameraTracking = cameraTracking && arcoreUnavailable == null;
-        this.arcoreUnavailable = arcoreUnavailable;
+    public void setValues(boolean lens, float eyeShift, int mode, String sixDofUnavailable) {
+        this.sixDofUnavailable = sixDofUnavailable;
         this.lens = lens;
         this.eyeShift = eyeShift;
         this.mode = mode;
@@ -223,22 +193,14 @@ public class SettingsOverlay extends FrameLayout {
 
     private void refresh() {
         style(mode3, mode == MODE_3DOF, true);
-        style(mode6, mode == MODE_6DOF, true);
-        boolean six = mode == MODE_6DOF;
-        camLabel.setVisibility(six ? VISIBLE : GONE);
-        camRow.setVisibility(six ? VISIBLE : GONE);
-        style(camOff, !cameraTracking, true);
-        style(camOn, cameraTracking, arcoreUnavailable == null);
+        style(mode6, mode == MODE_6DOF, sixDofUnavailable == null);
         style(modeF, mode == MODE_FOLLOW, true);
         note.setTextColor(MUTED);
         if (mode == MODE_FOLLOW) {
             note.setText("Tracks head turns. The browser glides back in front of you when you look away.");
-        } else if (mode == MODE_6DOF && cameraTracking) {
-            note.setText("Tracks turning and walking with the camera (ARCore). Needs light and a textured "
-                    + "area to look at; the motion sensors cover short dropouts.");
         } else if (mode == MODE_6DOF) {
-            note.setText("Tracks turning, leaning and small head movements with the motion sensors. "
-                    + "Walking around isn't tracked: without the camera, a phone can't measure how far it moved.");
+            note.setText("Tracks turning and moving, using ARCore. The browser stays put in the room, "
+                    + "so you can walk up to it. Point the camera at a textured area for a moment to start.");
         } else {
             note.setText("Tracks head turns. The browser stays where it is; press Menu on the controller to bring it back.");
         }

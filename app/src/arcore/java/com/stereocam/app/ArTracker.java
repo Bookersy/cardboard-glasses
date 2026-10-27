@@ -31,7 +31,7 @@ public class ArTracker implements SixDofTracker {
         ArCoreApk.Availability av = ArCoreApk.getInstance().checkAvailability(a);
         switch (av) {
             case UNSUPPORTED_DEVICE_NOT_CAPABLE:
-                return "This phone doesn't support ARCore, so camera tracking isn't possible. Motion-sensor 6DoF still works.";
+                return "This phone doesn't support ARCore, so 6DoF isn't possible on it.";
             default:
                 return null; // supported, needs install/update, or still checking
         }
