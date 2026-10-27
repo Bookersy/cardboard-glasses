@@ -142,9 +142,12 @@ public class BrowserWindow {
         // Links that open a new tab get their own floating window.
         s.setSupportMultipleWindows(true);
         s.setJavaScriptCanOpenWindowsAutomatically(true);
-        // No saved-password or saved-form prompts from the browser itself.
-        s.setSavePassword(false);
-        s.setSaveFormData(false);
+        // No saved-form prompts from the browser itself (made by name: newer Android SDKs drop
+        // these old calls). The system's password prompts are blocked by NoAutofill.
+        try {
+            WebSettings.class.getMethod("setSaveFormData", boolean.class).invoke(s, false);
+        } catch (Exception ignored) {
+        }
         NoAutofill.apply(web);
 
         web.setFocusable(true);
