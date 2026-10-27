@@ -40,6 +40,8 @@ import android.view.View;
 import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -88,6 +90,7 @@ public class MainActivity extends Activity implements SensorEventListener {
     private PanelHost host;
     private WebView web;
     private VrKeyboard keyboard;
+    private View loadingBar;
     private SettingsOverlay settings;
     private View gear, resetButton;
     private SharedPreferences prefs;
@@ -165,6 +168,12 @@ public class MainActivity extends Activity implements SensorEventListener {
         FrameLayout.LayoutParams kl = new FrameLayout.LayoutParams(px(WEB_W), px(KB_H));
         kl.topMargin = px(WEB_H);
         host.addView(keyboard, kl);
+        // Thin bar across the top of the page while it loads.
+        loadingBar = new View(this);
+        loadingBar.setBackgroundColor(0xFF4C7DF0);
+        loadingBar.setPivotX(0f);
+        loadingBar.setScaleX(0f);
+        host.addView(loadingBar, new FrameLayout.LayoutParams(px(WEB_W), px(5)));
         root.addView(host, new FrameLayout.LayoutParams(px(WEB_W), px(TEX_H)));
 
         glView = new GLSurfaceView(this);
@@ -285,6 +294,9 @@ public class MainActivity extends Activity implements SensorEventListener {
         s.setUseWideViewPort(true);
         s.setSupportZoom(false);
         s.setMediaPlaybackRequiresUserGesture(false);
+        // The browser is laid out bigger than the phone's screen and drawn off-screen into the
+        // panel, so make it draw the whole page rather than only the part it thinks is visible.
+        s.setOffscreenPreRaster(true);
         web.setFocusable(true);
         web.setFocusableInTouchMode(true);
         web.addJavascriptInterface(new Object() {
@@ -308,8 +320,19 @@ public class MainActivity extends Activity implements SensorEventListener {
             public void onPageCommitVisible(WebView v, String url) {
                 injectFocusWatcher();
             }
+
+            @Override
+            public void onReceivedError(WebView v, WebResourceRequest req, WebResourceError err) {
+                if (req.isForMainFrame()) toast("Page didn't load: " + err.getDescription());
+            }
         });
-        web.setWebChromeClient(new WebChromeClient());
+        web.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onProgressChanged(WebView v, int progress) {
+                loadingBar.setScaleX(progress / 100f);
+                loadingBar.setVisibility(progress >= 100 ? View.INVISIBLE : View.VISIBLE);
+            }
+        });
         web.loadUrl(HOME);
     }
 
@@ -632,6 +655,10 @@ public class MainActivity extends Activity implements SensorEventListener {
             renderer.cursorU = cursorX / WEB_W;
             renderer.cursorV = cursorY / TEX_H;
             renderer.visibleFrac = visH / TEX_H;
+
+            // Redraw the panel every frame. Waiting for the page to say it changed missed
+            // updates, so clicks looked like they did nothing until something else redrew.
+            host.invalidate();
 
             Choreographer.getInstance().postFrameCallback(this);
         }

@@ -9,8 +9,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION_CODE=12
-VERSION_NAME=2.1
+VERSION_CODE=13
+VERSION_NAME=2.2
 PKG=com.stereocam.app
 SRC=app/src/main
 OUT=build
