@@ -1,0 +1,36 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android build tools (Ubuntu packages, no Gradle)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            android-sdk-build-tools android-sdk-platform-23 apksigner zipalign dalvik-exchange zip
+
+      - name: Restore signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > stereocam.keystore
+            echo "Using the saved signing key, so this APK updates the installed app."
+          else
+            echo "::warning::No KEYSTORE_B64 secret set. This build uses a throwaway key and won't install over an existing StereoCam."
+          fi
+
+      - name: Build
+        run: bash build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StereoCam-apk
+          path: build/StereoCam.apk
