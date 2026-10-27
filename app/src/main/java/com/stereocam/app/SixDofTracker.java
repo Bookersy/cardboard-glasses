@@ -34,4 +34,20 @@ public interface SixDofTracker {
 
     /** Last error message, if update returned FAILED. */
     String lastError();
+
+    /** Why tracking is paused right now, in plain words, or null when tracking is fine. */
+    String trackingHint();
+
+    /**
+     * Pins a point in the room (GL thread). The tracker keeps it attached to the real
+     * world as its map improves, so things placed there don't slide. False if it can't
+     * place one right now (e.g. not tracking); try again later.
+     */
+    boolean setAnchor(float x, float y, float z);
+
+    /**
+     * Current position of the pinned point, and localDir turned by however the tracker has
+     * corrected it since. False if there's no anchor or it isn't being tracked.
+     */
+    boolean getAnchor(float[] localDir, float[] outPos, float[] outDir);
 }

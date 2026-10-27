@@ -877,7 +877,15 @@ public class MainActivity extends Activity implements SensorEventListener {
         private int arTexId;
         private final float[] arRight = new float[3], arUp = new float[3], arFwd = new float[3],
                 arPos = new float[3], arMatrix = new float[16], arCamInfo = {0.62f, 16f / 9f};
-        private boolean arHavePose, arCameraLive;
+        private boolean arHavePose, arCameraLive, arLost;
+        // Anchor: where the panel is pinned in ARCore's map, and its facing direction in anchor space.
+        private boolean arAnchorPending;
+        private final float[] anchorLocalDir = new float[3];
+        // Last good ARCore pose, with the rotation sensor's reading at that moment, so head turns
+        // can still be followed (with the gyroscope) while ARCore has lost tracking.
+        private final float[] arLastBasis = new float[9], sensorLastBasis = new float[9];
+        private boolean arBridgeReady;
+        private long lastHintMs;
 
         // Panel: metres per texture pixel, and distance from your eyes.
         private static final float PANEL_DIST = 1.5f;
@@ -1098,7 +1106,13 @@ public class MainActivity extends Activity implements SensorEventListener {
                     });
                 } else {
                     arCameraLive = st >= SixDofTracker.CAMERA_ONLY;
-                    if (st == SixDofTracker.TRACKING) arHavePose = true;
+                    arLost = st == SixDofTracker.CAMERA_ONLY;
+                    if (st == SixDofTracker.TRACKING) {
+                        arHavePose = true;
+                        rememberTrackedPose();
+                    } else if (st == SixDofTracker.CAMERA_ONLY) {
+                        showTrackingHint();
+                    }
                 }
             } else {
                 try {
@@ -1163,6 +1177,60 @@ public class MainActivity extends Activity implements SensorEventListener {
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
         }
 
+        /** Saves the ARCore pose and the rotation sensor's reading taken at the same moment. */
+        private void rememberTrackedPose() {
+            putBasis(arLastBasis, arRight, arUp, arFwd);
+            float[] r = new float[9];
+            boolean have;
+            synchronized (this) {
+                have = haveRot;
+                System.arraycopy(rot, 0, r, 0, 9);
+            }
+            if (have) {
+                float[][] b = sensorBasis(r);
+                putBasis(sensorLastBasis, b[0], b[1], b[2]);
+            }
+            arBridgeReady = have;
+        }
+
+        private void showTrackingHint() {
+            long now = SystemClock.uptimeMillis();
+            if (now - lastHintMs < 8000) return;
+            final String h = tracker.trackingHint();
+            if (h == null) return;
+            lastHintMs = now;
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    toast(h);
+                }
+            });
+        }
+
+        /** Columns: right, up, back (= -forward). */
+        private void putBasis(float[] m, float[] right, float[] up, float[] fwd) {
+            for (int i = 0; i < 3; i++) {
+                m[i] = right[i];
+                m[3 + i] = up[i];
+                m[6 + i] = -fwd[i];
+            }
+        }
+
+        /** Head right / up / forward in the rotation sensor's world, from its rotation matrix. */
+        private float[][] sensorBasis(float[] r) {
+            // Phone axes (X right, Y up, Z out of the screen in its natural portrait pose),
+            // re-labelled for how the screen is turned. The back camera looks along -Z.
+            float[] X = {r[0], r[3], r[6]}, Y = {r[1], r[4], r[7]}, Z = {r[2], r[5], r[8]};
+            float[] right, up;
+            switch (displayRotation) {
+                case Surface.ROTATION_0:   right = X;      up = Y;      break;
+                case Surface.ROTATION_180: right = neg(X); up = neg(Y); break;
+                case Surface.ROTATION_270: right = Y;      up = neg(X); break;
+                default:                   right = neg(Y); up = X;      break; // ROTATION_90
+            }
+            return new float[][]{right, up, neg(Z)};
+        }
+
         /** Works out where the head points, eases the panel toward it, and uploads both. */
         private void setPanelUniforms() {
             long now = System.nanoTime();
@@ -1189,6 +1257,7 @@ public class MainActivity extends Activity implements SensorEventListener {
             GLES20.glUniform1f(uVis, vis);
             GLES20.glUniform2f(uCursor, cursorU, cursorV);
             GLES20.glUniform1f(uPress, pressed ? 1f : 0f);
+            boolean sensorOk = ok;
             boolean ar = useAr;
             if (ar) {
                 ok = arHavePose;
@@ -1199,24 +1268,34 @@ public class MainActivity extends Activity implements SensorEventListener {
                 return;
             }
 
-            // Phone axes (X right, Y up, Z out of the screen in its natural portrait pose),
-            // re-labelled for how the screen is turned. The back camera looks along -Z.
-            float[] X = {r[0], r[3], r[6]}, Y = {r[1], r[4], r[7]}, Z = {r[2], r[5], r[8]};
-            float[] right, up;
-            switch (displayRotation) {
-                case Surface.ROTATION_0:   right = X;      up = Y;      break;
-                case Surface.ROTATION_180: right = neg(X); up = neg(Y); break;
-                case Surface.ROTATION_270: right = Y;      up = neg(X); break;
-                default:                   right = neg(Y); up = X;      break; // ROTATION_90
-            }
-            float[] fwd = neg(Z);
+            float[][] sb = sensorBasis(r);
+            float[] right = sb[0], up = sb[1], fwd = sb[2];
             // Which way is up in this world: +Z for the rotation sensor, +Y for ARCore.
             float[] worldUp = {0f, 0f, 1f};
             if (ar) {
-                right = arRight.clone();
-                up = arUp.clone();
-                fwd = arFwd.clone();
                 worldUp = new float[]{0f, 1f, 0f};
+                if (arLost && arBridgeReady && sensorOk) {
+                    // ARCore lost tracking: turn its last pose by however far the gyroscope
+                    // says the head has turned since, so the panel doesn't stick to your face.
+                    float[] sNow = new float[9];
+                    putBasis(sNow, sb[0], sb[1], sb[2]);
+                    float[] aNow = new float[9];
+                    for (int j = 0; j < 3; j++) {
+                        for (int i = 0; i < 3; i++) {
+                            float d = sensorLastBasis[3 * i] * sNow[3 * j]
+                                    + sensorLastBasis[3 * i + 1] * sNow[3 * j + 1]
+                                    + sensorLastBasis[3 * i + 2] * sNow[3 * j + 2];
+                            for (int k = 0; k < 3; k++) aNow[3 * j + k] += arLastBasis[3 * i + k] * d;
+                        }
+                    }
+                    right = new float[]{aNow[0], aNow[1], aNow[2]};
+                    up = new float[]{aNow[3], aNow[4], aNow[5]};
+                    fwd = new float[]{-aNow[6], -aNow[7], -aNow[8]};
+                } else {
+                    right = arRight.clone();
+                    up = arUp.clone();
+                    fwd = arFwd.clone();
+                }
             }
 
             if (!panelPlaced || recenter) {
@@ -1226,6 +1305,7 @@ public class MainActivity extends Activity implements SensorEventListener {
                 panelPlaced = true;
                 recenter = false;
                 following = false;
+                arAnchorPending = ar; // pin it in ARCore's map so it doesn't slide
             } else if (follow) {
                 // Smooth follow: stay put while you look around the panel, glide back
                 // once you look well away, and keep the same distance if you move (6DoF).
@@ -1248,6 +1328,21 @@ public class MainActivity extends Activity implements SensorEventListener {
             } else {
                 // 3DoF / 6DoF: the panel stays where it is in the room.
                 following = false;
+            }
+
+            if (ar && !follow) {
+                if (arAnchorPending && !arLost
+                        && tracker.setAnchor(anchor[0], anchor[1], anchor[2])) {
+                    System.arraycopy(panelDir, 0, anchorLocalDir, 0, 3);
+                    arAnchorPending = false;
+                }
+                // Follow the anchor as ARCore refines its map of the room.
+                float[] p = new float[3], d = new float[3];
+                if (!arAnchorPending && tracker.getAnchor(anchorLocalDir, p, d)) {
+                    System.arraycopy(p, 0, anchor, 0, 3);
+                    System.arraycopy(d, 0, panelDir, 0, 3);
+                    norm(panelDir);
+                }
             }
 
             // Keep the panel level with the horizon.
