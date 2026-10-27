@@ -6,7 +6,7 @@ A Google Cardboard app for Android. It shows your phone's camera in both eyes an
 
 - Camera passthrough, side by side, with Cardboard lens correction
 - A floating browser panel, opening on Google, with an on-panel keyboard
-- Head tracking modes: 3DoF (the panel stays put) and Smooth follow (it glides back in front of you). 6DoF is planned and needs ARCore.
+- Head tracking modes: 3DoF (the panel stays put), 6DoF with ARCore (you can walk around the panel; needs an ARCore-supported phone) and Smooth follow (it glides back in front of you)
 - Reset button (top left) and settings (top right)
 
 ## Controller
@@ -22,7 +22,7 @@ A Google Cardboard app for Android. It shows your phone's camera in both eyes an
 
 ## Building
 
-The app builds without Gradle, using Ubuntu's Android SDK packages; `build.sh` has the whole pipeline. Every push runs the **Build APK** workflow. To download the APK, open the run in the Actions tab and get **StereoCam-apk** from the Artifacts section.
+The app builds without Gradle; `build.sh` has the whole pipeline. It uses a full Android SDK when `ANDROID_HOME` has one, and includes ARCore when `ARCORE_AAR` points to the library. Otherwise it falls back to Ubuntu's Android packages and builds without 6DoF. Every push runs the **Build APK** workflow, which downloads ARCore. To download the APK, open the run in the Actions tab and get **StereoCam-apk** from the Artifacts section.
 
 Updates only install over the existing app when they're signed with the same key. Store the key, base64-encoded, as a repository secret named `KEYSTORE_B64` (Settings → Secrets and variables → Actions). Never commit the keystore; this repo is public.
 
@@ -33,4 +33,5 @@ Updates only install over the existing app when they're signed with the same key
 - `VrKeyboard.java`: the on-panel keyboard
 - `SettingsOverlay.java`: the settings sheet plus the gear and reset buttons
 
-For 6DoF, `StereoRenderer.setHeadPosition(x, y, z)` is the hook a positional tracker such as ARCore should feed. The panel is already anchored in world space, so reset and Smooth follow use your head position.
+- `SixDofTracker.java`: interface for positional tracking; `app/src/arcore/.../ArTracker.java` is the ARCore implementation, loaded by name so builds without ARCore still work
+- `tools/merge_manifest.py`: merges ARCore's manifest into the app's (Gradle normally does this)
